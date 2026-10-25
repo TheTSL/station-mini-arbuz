@@ -18,8 +18,8 @@
 #define MUTE_HOLD_MS 900
 #define MIN_MM       150
 #define MAX_MM       400
-#define STEP_MM      15
-#define MAX_STEP     19
+#define LEVELS       10
+#define MAX_STEP     10
 #define OUT_MM       400
 #define SETTLE_MS    200
 
@@ -73,14 +73,14 @@ int main(int argc, char **argv) {
         int step;
         if (d <= MIN_MM) step = 0;
         else if (d >= MAX_MM) step = MAX_STEP;
-        else step = (d - MIN_MM) / STEP_MM;
+        else step = (d - MIN_MM) * LEVELS / (MAX_MM - MIN_MM);
 
         if (cand_step != step) { cand_step = step; cand_t = t; }
 
         if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
             int prev = cur_step;
             cur_step = cand_step;
-            int vol = 5 + cur_step * 5;
+            int vol = cur_step * 10;
             char cmd[256];
             snprintf(cmd, sizeof(cmd), AMIX "sset 'Master' %d%% >/dev/null 2>&1", vol);
             run(cmd);
