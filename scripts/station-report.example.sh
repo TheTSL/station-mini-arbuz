@@ -1,4 +1,4 @@
-﻿#!/bin/sh
+#!/bin/sh
 # Collect station status, post it to the VPS API, apply remote commands.
 PANEL="https://PANEL_HOST:PORT/station"
 TOKEN="CHANGE_ME_TOKEN"
@@ -80,4 +80,3 @@ if [ -n "$TARGET" ] && [ "$TARGET" != "$MODE" ]; then
         fi
     fi
 fi
-

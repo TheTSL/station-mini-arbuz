@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 import traceback
 
@@ -16,6 +17,10 @@ VOL = os.path.join(PANEL_DIR, "desired_volume")
 MUTE = os.path.join(PANEL_DIR, "desired_mute")
 ALLOWED = os.path.join(BASE_DIR, "allowed_chat")
 
+LIVE = {}          # chat_id -> {"message_id": int, "until": ts}
+LIVE_LOCK = threading.Lock()
+LIVE_INTERVAL = 3
+
 
 def read(path, default=""):
     try:
@@ -31,14 +36,6 @@ def write(path, value):
     os.replace(tmp, path)
 
 
-def allowed_chat():
-    return read(ALLOWED)
-
-
-def set_allowed(chat_id):
-    write(ALLOWED, chat_id)
-
-
 def state():
     try:
         return json.load(open(STATE))
@@ -46,89 +43,140 @@ def state():
         return {}
 
 
-def fmt_status():
-    d = state()
+def fmt_status(d=None):
+    d = d or state()
     if not d:
-        return "Нет данных с колонки."
+        return "⚠️ Нет данных с колонки."
     age = int(time.time()) - d.get("_ts", 0) if d.get("_ts") else None
+    mode = d.get("mode", "—")
+    mode_ru = {"normal": "Алиса", "maind-free": "свой режим"}.get(mode, mode)
+    dot = "🟢" if age is not None and age < 15 else "🟡" if age is not None and age < 60 else "🔴"
+    mute = d.get("mute", "—")
 
     def yn(v):
         return "да" if v else "нет"
 
     lines = [
-        f"*{d.get('model', '—')}*",
-        f"Прошивка: `{d.get('version', '—')}`",
-        f"Режим: *{d.get('mode', '—')}*" + (f" (запрошено: {d.get('desired')})" if d.get("desired") else ""),
-        f"Uptime: {d.get('uptime', '—')}",
-        f"RAM свободно: {d.get('mem_free', '—')}",
-        f"Load: {d.get('load', '—')}",
-        "",
-        f"maind platformd: {yn(d.get('maind_platformd'))}",
-        f"maind mediad: {yn(d.get('maind_mediad'))}",
-        f"ADB: {yn(d.get('adb'))} · SSH: {yn(d.get('ssh'))}",
-        "",
-        f"Громкость: *{d.get('volume', '—')}* · mute: {d.get('mute', '—')}",
-        f"Wi-Fi: {d.get('wifi_ssid', '—')} ({d.get('wifi_signal', '—')})",
-        f"Температура: {d.get('temp', '—')}",
-        f"Датчик: {d.get('distance', '—')}",
+        f"{dot} *YNDX-0004* · `{d.get('version', '—')}`",
+        f"Режим: *{mode_ru}*" + (f" → {d.get('desired')}" if d.get("desired") and d.get("desired") != mode else ""),
+        f"Громкость: *{d.get('volume', '—')}* · mute: *{mute}*",
+        f"Uptime: {d.get('uptime', '—')} · RAM: {d.get('mem_free', '—')} · load: {d.get('load', '—')}",
+        f"Wi-Fi: {d.get('wifi_ssid', '—')} ({d.get('wifi_signal', '—')}) · 🌡 {d.get('temp', '—')}",
+        f"ADB: {yn(d.get('adb'))} · SSH: {yn(d.get('ssh'))} · датчик: {d.get('distance', '—')}",
+        f"maind: platformd {yn(d.get('maind_platformd'))}, mediad {yn(d.get('maind_mediad'))}",
     ]
     if age is not None:
-        lines.append(f"\nОбновлено {age} с назад")
+        lines.append(f"_{age} с назад_")
     return "\n".join(lines)
 
 
-KEYBOARD = {
-    "inline_keyboard": [
-        [{"text": "Алиса", "callback_data": "mode:alice"},
-         {"text": "Свой режим", "callback_data": "mode:custom"}],
-        [{"text": "Громкость −10", "callback_data": "vol:-10"},
-         {"text": "Громкость +10", "callback_data": "vol:+10"}],
-        [{"text": "Mute", "callback_data": "mute:on"},
-         {"text": "Unmute", "callback_data": "mute:off"}],
-        [{"text": "Статус", "callback_data": "status"}],
-    ]
-}
+def keyboard(d=None):
+    d = d or state()
+    mode = d.get("mode", "")
+    vol = d.get("volume", "—")
+    mute = d.get("mute", "")
+    alice_mark = "✓ " if mode == "normal" else ""
+    custom_mark = "✓ " if mode == "maind-free" else ""
+    mute_btn = "🔊 Unmute" if mute == "on" else "🔇 Mute"
+    return {
+        "inline_keyboard": [
+            [{"text": f"{alice_mark}Алиса", "callback_data": "mode:alice"},
+             {"text": f"{custom_mark}Свой режим", "callback_data": "mode:custom"}],
+            [{"text": "−10", "callback_data": "vol:-10"},
+             {"text": f"🔊 {vol}", "callback_data": "status"},
+             {"text": "+10", "callback_data": "vol:+10"}],
+            [{"text": mute_btn, "callback_data": "mute:on" if mute != "on" else "mute:off"}],
+            [{"text": "🔄 Обновить", "callback_data": "status"},
+             {"text": "⏱ Живой режим", "callback_data": "live"},
+             {"text": "⏹ Стоп", "callback_data": "stop"}],
+        ]
+    }
 
 
-def send(chat_id, text, keyboard=True):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    if keyboard:
-        payload["reply_markup"] = json.dumps(KEYBOARD)
+def tg(method, **kwargs):
     try:
-        requests.post(API + "/sendMessage", data=payload, timeout=20)
+        return requests.post(API + "/" + method, data=kwargs, timeout=25).json()
     except Exception:
-        pass
+        return {}
+
+
+def send(chat_id, text, kb=None):
+    r = tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown",
+           reply_markup=json.dumps(kb or keyboard()))
+    res = r.get("result") or {}
+    return res.get("message_id")
+
+
+def edit(chat_id, message_id, text, kb=None):
+    tg("editMessageText", chat_id=chat_id, message_id=message_id, text=text,
+       parse_mode="Markdown", reply_markup=json.dumps(kb or keyboard()))
 
 
 def answer_cb(cb_id, text=""):
-    try:
-        requests.post(API + "/answerCallbackQuery",
-                      data={"callback_query_id": cb_id, "text": text}, timeout=15)
-    except Exception:
-        pass
+    tg("answerCallbackQuery", callback_query_id=cb_id, text=text)
+
+
+def live_loop():
+    while True:
+        time.sleep(LIVE_INTERVAL)
+        now = time.time()
+        with LIVE_LOCK:
+            items = list(LIVE.items())
+        for chat_id, info in items:
+            if now > info["until"]:
+                with LIVE_LOCK:
+                    LIVE.pop(chat_id, None)
+                continue
+            d = state()
+            edit(chat_id, info["message_id"], fmt_status(d), keyboard(d))
+
+
+def start_live(chat_id, message_id, minutes=30):
+    with LIVE_LOCK:
+        LIVE[chat_id] = {"message_id": message_id, "until": time.time() + minutes * 60}
+
+
+def stop_live(chat_id):
+    with LIVE_LOCK:
+        LIVE.pop(chat_id, None)
+
+
+def allowed_chat():
+    return read(ALLOWED)
 
 
 def handle(chat_id, text):
-    text = (text or "").strip()
-    low = text.lower()
+    low = (text or "").strip().lower()
+    d = state()
 
     if low in ("/start", "/help", "start"):
-        send(chat_id, "Бот колонки. /status — состояние, /alice и /custom — режим, /vol 40 — громкость, /mute и /unmute.")
-        send(chat_id, fmt_status())
+        mid = send(chat_id, fmt_status(d))
+        start_live(chat_id, mid)
         return
 
     if low in ("/status", "статус"):
-        send(chat_id, fmt_status())
+        mid = send(chat_id, fmt_status(d))
+        start_live(chat_id, mid)
+        return
+
+    if low in ("/live", "живой"):
+        mid = send(chat_id, fmt_status(d))
+        start_live(chat_id, mid)
+        return
+
+    if low in ("/stop", "стоп"):
+        stop_live(chat_id)
+        send(chat_id, "Обновление остановлено.")
         return
 
     if low in ("/alice", "алиса"):
         write(MODE, "alice")
-        send(chat_id, "Запрошен режим Алисы. Колонка перезагрузится в течение ~15 с.")
+        send(chat_id, "Запрошен режим Алисы. Колонка перезагрузится.")
         return
 
     if low in ("/custom", "свой"):
         write(MODE, "custom")
-        send(chat_id, "Запрошен свой режим. Колонка перезагрузится в течение ~15 с.")
+        send(chat_id, "Запрошен свой режим. Колонка перезагрузится.")
         return
 
     if low.startswith("/vol"):
@@ -151,15 +199,16 @@ def handle(chat_id, text):
         send(chat_id, "Mute выключен.")
         return
 
-    send(chat_id, "Не понял. /status, /alice, /custom, /vol 40, /mute, /unmute")
+    send(chat_id, "Команды: /status (живой режим), /alice, /custom, /vol 40, /mute, /unmute, /stop")
 
 
 def main():
+    threading.Thread(target=live_loop, daemon=True).start()
     offset = 0
     while True:
         try:
             r = requests.get(API + "/getUpdates",
-                             params={"offset": offset, "timeout": 30}, timeout=40)
+                             params={"offset": offset, "timeout": 30}, timeout=45)
             data = r.json()
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
@@ -167,34 +216,40 @@ def main():
                 if "callback_query" in upd:
                     cq = upd["callback_query"]
                     chat_id = str(cq["message"]["chat"]["id"])
+                    msg_id = cq["message"]["message_id"]
                     if allowed_chat() and chat_id != allowed_chat():
                         answer_cb(cq["id"], "Нет доступа")
                         continue
-                    data_cb = cq.get("data", "")
-                    if data_cb == "status":
-                        answer_cb(cq["id"], "Статус")
-                        send(chat_id, fmt_status())
-                    elif data_cb.startswith("mode:"):
-                        m = data_cb.split(":", 1)[1]
+                    cb = cq.get("data", "")
+                    if cb == "status":
+                        answer_cb(cq["id"], "Обновлено")
+                        edit(chat_id, msg_id, fmt_status(), keyboard())
+                        start_live(chat_id, msg_id)
+                    elif cb == "live":
+                        answer_cb(cq["id"], "Живой режим включён")
+                        start_live(chat_id, msg_id)
+                    elif cb == "stop":
+                        stop_live(chat_id)
+                        answer_cb(cq["id"], "Остановлено")
+                        edit(chat_id, msg_id, "⏹ Обновление остановлено.\n\n" + fmt_status(), keyboard())
+                    elif cb.startswith("mode:"):
+                        m = cb.split(":", 1)[1]
                         write(MODE, m)
                         answer_cb(cq["id"], "Режим: " + m)
-                        send(chat_id, f"Запрошен режим *{m}*. Колонка перезагрузится.")
-                    elif data_cb.startswith("vol:"):
-                        delta = int(data_cb.split(":", 1)[1])
-                        cur = state().get("volume", "0%").replace("%", "")
+                        edit(chat_id, msg_id, fmt_status(), keyboard())
+                    elif cb.startswith("vol:"):
+                        delta = int(cb.split(":", 1)[1])
                         try:
-                            base = int(cur)
+                            base = int(state().get("volume", "0%").replace("%", ""))
                         except Exception:
                             base = 50
                         v = max(0, min(100, base + delta))
                         write(VOL, v)
                         answer_cb(cq["id"], f"{v}%")
-                        send(chat_id, f"Громкость → {v}%.")
-                    elif data_cb.startswith("mute:"):
-                        m = data_cb.split(":", 1)[1]
+                    elif cb.startswith("mute:"):
+                        m = cb.split(":", 1)[1]
                         write(MUTE, m)
                         answer_cb(cq["id"], m)
-                        send(chat_id, "Mute " + m)
                     continue
 
                 msg = upd.get("message") or upd.get("edited_message")
@@ -202,8 +257,8 @@ def main():
                     continue
                 chat_id = str(msg["chat"]["id"])
                 if not allowed_chat():
-                    set_allowed(chat_id)
-                    send(chat_id, "Доступ привязан к этому чату. Отправь /status.")
+                    write(ALLOWED, chat_id)
+                    send(chat_id, "Доступ привязан к этому чату. /status — состояние.")
                     continue
                 if chat_id != allowed_chat():
                     continue
