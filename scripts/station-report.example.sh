@@ -5,7 +5,7 @@ TOKEN="CHANGE_ME_TOKEN"
 OUT=/tmp/station-report.json
 Q=/system/vendor/quasar
 ALICE_TPL=/data/local/tmp/backup_q/launch.alice.json
-LAST_SWITCH=/tmp/last_switch
+LAST_SWITCH=/data/local/tmp/last_switch
 
 amx() {
     LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer "$@" 2>/dev/null
@@ -24,6 +24,9 @@ if ps | grep -q '[m]aind --platformd'; then PD=1; else PD=0; fi
 if ps | grep -q '[m]aind --mediad'; then MD=1; else MD=0; fi
 if ps | grep -q '[v]olgest'; then VG=1; else VG=0; fi
 if [ "$PD" = "1" ] || [ "$MD" = "1" ]; then MODE="normal"; else MODE="maind-free"; fi
+# РґР»СЏ РїРµСЂРµРєР»СЋС‡РµРЅРёСЏ СЂРµР¶РёРј РѕРїСЂРµРґРµР»СЏРµРј РїРѕ РєРѕРЅС„РёРіСѓ, Р° РЅРµ РїРѕ РїСЂРѕС†РµСЃСЃР°Рј:
+# СЃСЂР°Р·Сѓ РїРѕСЃР»Рµ СЂРµР±СѓС‚Р° maind РµС‰С‘ РЅРµ СЃС‚Р°СЂС‚РѕРІР°Р», Рё СЌС‚Рѕ РІС‹Р·С‹РІР°Р»Рѕ Р»РѕР¶РЅС‹Рµ СЃСЂР°Р±Р°С‚С‹РІР°РЅРёСЏ
+if grep -q 'quasar/maind' $Q/launch.json 2>/dev/null; then CFG_MODE="normal"; else CFG_MODE="maind-free"; fi
 
 if netstat -ln 2>/dev/null | grep -q ':5555'; then ADB=1; else ADB=0; fi
 if netstat -ln 2>/dev/null | grep -q ':2222'; then SSH=1; else SSH=0; fi
@@ -63,8 +66,8 @@ if [ -n "$MUTE_T" ] && [ "$MUTE_T" != "$MUTE" ]; then
     amx -c 0 sset 'SPK mute' "$MUTE_T" >/dev/null 2>&1
 fi
 
-if [ -n "$TARGET" ] && [ "$TARGET" != "$MODE" ]; then
-    NOW=$(cut -d. -f1 /proc/uptime)
+if [ -n "$TARGET" ] && [ "$TARGET" != "$CFG_MODE" ]; then
+    NOW=$(date +%s)
     LAST=0
     [ -f "$LAST_SWITCH" ] && LAST=$(cat "$LAST_SWITCH" 2>/dev/null)
     if [ $((NOW - LAST)) -gt 240 ]; then
