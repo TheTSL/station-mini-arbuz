@@ -180,6 +180,9 @@ def handle(chat_id, text):
         return
 
     if low.startswith("/vol"):
+        if state().get("mode") == "normal":
+            send(chat_id, "В режиме Алисы громкость меняется голосом или жестом. Переключись в свой режим, чтобы управлять из бота.")
+            return
         parts = low.split()
         if len(parts) == 2 and parts[1].lstrip("+-").isdigit():
             v = max(0, min(100, int(parts[1])))
@@ -238,6 +241,9 @@ def main():
                         answer_cb(cq["id"], "Режим: " + m)
                         edit(chat_id, msg_id, fmt_status(), keyboard())
                     elif cb.startswith("vol:"):
+                        if state().get("mode") == "normal":
+                            answer_cb(cq["id"], "В режиме Алисы громкость — голосом или жестом")
+                            continue
                         delta = int(cb.split(":", 1)[1])
                         try:
                             base = int(state().get("volume", "0%").replace("%", ""))

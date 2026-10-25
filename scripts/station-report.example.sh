@@ -32,11 +32,11 @@ if netstat -ln 2>/dev/null | grep -q ':5555'; then ADB=1; else ADB=0; fi
 if netstat -ln 2>/dev/null | grep -q ':2222'; then SSH=1; else SSH=0; fi
 
 # РњРёРєС€РµСЂ РѕРїСЂР°С€РёРІР°РµРј СЂРµРґРєРѕ (СЂР°Р· РІ 30 СЃ): С‡Р°СЃС‚РѕРµ РѕС‚РєСЂС‹С‚РёРµ ALSA-РєРѕРЅС‚СЂРѕР»РѕРІ
-# РЅР° СЌС‚РѕР№ РїСЂРѕС€РёРІРєРµ РґР°С‘С‚ С‰РµР»С‡РєРё РІ Р·РІСѓРєРµ.
+# РЅР° СЌС‚РѕР№ РїСЂРѕС€РёРІРєРµ РґР°С‘С‚ С‰РµР»С‡РєРё РІ Р·РІСѓРєРµ. Р Р°Р±РѕС‚Р°РµС‚ РІ РѕР±РѕРёС… СЂРµР¶РёРјР°С….
 AMX_TS=/tmp/amixer_ts
 CUR_TS=$(date +%s)
 LAST_TS=$(cat $AMX_TS 2>/dev/null || echo 0)
-if [ "$CFG_MODE" = "custom" ] && [ $((CUR_TS - LAST_TS)) -gt 30 ]; then
+if [ $((CUR_TS - LAST_TS)) -gt 30 ]; then
     VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]')
     MUTE=$(amx -c 0 sget 'SPK mute' | grep -oE '\[(on|off)\]' | head -1 | tr -d '[]')
     echo "$VOL" > /tmp/vol.cache
@@ -45,6 +45,20 @@ if [ "$CFG_MODE" = "custom" ] && [ $((CUR_TS - LAST_TS)) -gt 30 ]; then
 else
     VOL=$(cat /tmp/vol.cache 2>/dev/null)
     MUTE=$(cat /tmp/mute.cache 2>/dev/null)
+fi
+
+# РџРѕСЃР»Рµ РїРµСЂРµРєР»СЋС‡РµРЅРёСЏ СЂРµР¶РёРјР° РІРѕР·РІСЂР°С‰Р°РµРј РіСЂРѕРјРєРѕСЃС‚СЊ, РєРѕС‚РѕСЂР°СЏ Р±С‹Р»Р° РґРѕ СЂРµР±СѓС‚Р°.
+LV=/data/local/tmp/last_volume
+if [ -f "$LV" ]; then
+    set -- $(cat "$LV")
+    LV_TS=$1; LV_VAL=$2
+    if [ -n "$LV_TS" ] && [ -n "$LV_VAL" ] && [ $((CUR_TS - LV_TS)) -lt 180 ]; then
+        amx -c 0 sset 'Master' "${LV_VAL}%" >/dev/null 2>&1
+        VOL=$LV_VAL
+        echo "$VOL" > /tmp/vol.cache
+    else
+        rm -f "$LV"
+    fi
 fi
 
 SSID=$(iw dev wlan0 link 2>/dev/null | awk '/SSID/{print $2; exit}')
@@ -69,7 +83,7 @@ TARGET=$(echo "$CTRL" | sed -n 's/.*"desired":"\([a-z]*\)".*/\1/p')
 VOL_T=$(echo "$CTRL" | sed -n 's/.*"volume":"\([0-9]*\)".*/\1/p')
 MUTE_T=$(echo "$CTRL" | sed -n 's/.*"mute":"\([a-z]*\)".*/\1/p')
 
-if [ -n "$VOL_T" ]; then
+if [ -n "$VOL_T" ] && [ "$CFG_MODE" = "custom" ]; then
     CUR_VOL=$(echo "$VOL" | tr -d '%')
     if [ "$VOL_T" != "$CUR_VOL" ]; then
         amx -c 0 sset 'Master' "${VOL_T}%" >/dev/null 2>&1
@@ -85,6 +99,8 @@ if [ -n "$TARGET" ] && [ "$TARGET" != "$CFG_MODE" ]; then
     [ -f "$LAST_SWITCH" ] && LAST=$(cat "$LAST_SWITCH" 2>/dev/null)
     if [ $((NOW - LAST)) -gt 240 ]; then
         echo "$NOW" > "$LAST_SWITCH"
+        CUR_VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]%')
+        [ -n "$CUR_VOL" ] && echo "$NOW $CUR_VOL" > /data/local/tmp/last_volume
         if [ "$TARGET" = "alice" ] && [ -f "$ALICE_TPL" ]; then
             cp -f "$ALICE_TPL" $Q/launch.json
             sync
