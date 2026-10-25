@@ -31,3 +31,10 @@ scripts/               — проверенные скрипты (без сек�
 
 - Скрипты приведены как есть; пути и имена интерфейсов могут отличаться на других сборках.
 - Перед применением сделайте бэкапы оригинальных файлов прошивки.
+
+## Источники и благодарности
+
+- **[lite-kit](https://github.com/krevetkqqq/lite-kit)** — стенд для ADB/root на станциях; в нём зафиксирована рабочая для `yandexmini` прошивка `1.305.4.16` и то, что `adbd` нужно прописывать в четырёх местах конфига (`config.system_config`, `config.device_config`, `config` и верхний уровень).
+- **[eQuasar](https://git.gay/iwakura/eQuasar)** — исходный вектор с локальным HTTPS-прокси и публичный набор сертификатов eMudhra.
+- **[khadas/linux](https://github.com/khadas/linux/tree/buildroot-aml-4.9)** — открытые исходники Amlogic-ядра 4.9, включая `sound/soc/amlogic/auge/tdm.c` и `drivers/amlogic/audiodsp`.
+
