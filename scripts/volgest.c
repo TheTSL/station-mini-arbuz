@@ -6,12 +6,24 @@
 #include <time.h>
 #include <linux/input.h>
 
-#define NEAR_MM       100
-#define MUTE_STABLE_MS 900
-#define STABLE_D       12
-#define STABLE_MS      400
-#define MIN_SEG_MM     150
-#define COOLDOWN_MS    1000
+/* Ступенчатая громкость жестом:
+ *   d < MUTE_MM            -> mute по удержанию
+ *   d в [MIN_MM..MAX_MM]   -> 0..20 шагов по 5%
+ *   выше MAX_MM            -> максимум
+ * Каждое изменение шага сопровождается звуком: вверх/вниз.
+ * Mute — отдельные звуки включения/выключения.
+ */
+
+#define MUTE_MM      100
+#define MUTE_HOLD_MS 900
+#define MIN_MM       120
+#define MAX_MM       420
+#define STEP_MM      15
+#define MAX_STEP     19
+#define OUT_MM       450
+#define SETTLE_MS    200
+
+#define PLAYER "/tmp/pcm_play hw:0,0 /bkupgrade/snd/"
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -21,66 +33,60 @@ static long long now_ms(void) {
 static void run(const char *cmd) { if (system(cmd)) {} }
 #define AMIX "LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer -c 0 "
 
+static void play(const char *name) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), PLAYER "%s >/dev/null 2>&1", name);
+    run(cmd);
+}
+
 int main(int argc, char **argv) {
     const char *dev = argc > 1 ? argv[1] : "/dev/input/event0";
     int fd = open(dev, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
-    fprintf(stderr, "volgest: reading %s\n", dev);
+    fprintf(stderr, "volgest(step): %s\n", dev);
 
     struct input_event ev;
-    int last_d = -1, turn_d = -1, slope = 0;
-    long long last_t = 0, stable_since = 0, last_cmd = 0, near_since = 0;
-    int mute_latched = 0;
+    double ema = -1;
+    int cur_step = -1, cand_step = -1, muted = 0;
+    int last_written = -1;
+    long long cand_t = 0, near_since = 0, last_mute = 0;
 
     while (1) {
         ssize_t n = read(fd, &ev, sizeof(ev));
         if (n != sizeof(ev)) continue;
         if (ev.type != EV_ABS || ev.code != 8) continue;
-        int d = ev.value / 1000;
-        if (d <= 0) continue;
+        int raw = ev.value / 1000;
+        if (raw <= 0) continue;
         long long t = now_ms();
 
-        if (last_d < 0) { last_d = d; turn_d = d; last_t = t; stable_since = t; continue; }
+        ema = (ema < 0) ? raw : (ema * 0.6 + raw * 0.4);
+        int d = (int)(ema + 0.5);
 
-        int diff = d - last_d;
-        if (abs(diff) >= 6) {
-            int s = diff > 0 ? 1 : -1;
-            if (slope != 0 && s != slope) turn_d = last_d;  /* разворот */
-            slope = s;
-            stable_since = 0;
-        } else {
-            if (!stable_since) stable_since = t;
+        if (abs(d - last_written) >= 2) {
+            FILE *fp = fopen("/tmp/volgest.dist", "w");
+            if (fp) { fprintf(fp, "%d", d); fclose(fp); }
+            last_written = d;
         }
 
-        /* mute: стабильно вплотную */
-        if (d < NEAR_MM) {
-            if (!near_since) near_since = t;
-            if (!mute_latched && t - near_since > MUTE_STABLE_MS && t - last_cmd > COOLDOWN_MS) {
-                run(AMIX "sset 'SPK mute' toggle >/dev/null 2>&1");
-                fprintf(stderr, "MUTE toggle (d=%d)\n", d);
-                last_cmd = t; mute_latched = 1; turn_d = d;
-            }
-        } else { near_since = 0; mute_latched = 0; }
+        if (d > OUT_MM) { cand_step = -1; continue; }
 
-        /* конец движения: оцениваем последний участок */
-        if (stable_since && t - stable_since > STABLE_MS && t - last_cmd > COOLDOWN_MS) {
-            int seg = d - turn_d;
-            if (abs(seg) > MIN_SEG_MM) {
-                if (seg > 0) {
-                    run(AMIX "sset 'Master' 8%+ >/dev/null 2>&1");
-                    fprintf(stderr, "VOL + (%d -> %d)\n", turn_d, d);
-                } else {
-                    run(AMIX "sset 'Master' 8%- >/dev/null 2>&1");
-                    fprintf(stderr, "VOL - (%d -> %d)\n", turn_d, d);
-                }
-                last_cmd = t;
-            }
-            turn_d = d;
-            stable_since = 0;
+        int step;
+        if (d <= MIN_MM) step = 0;
+        else if (d >= MAX_MM) step = MAX_STEP;
+        else step = (d - MIN_MM) / STEP_MM;
+
+        if (cand_step != step) { cand_step = step; cand_t = t; }
+
+        if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
+            int prev = cur_step;
+            cur_step = cand_step;
+            int vol = 5 + cur_step * 5;
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), AMIX "sset 'Master' %d%% >/dev/null 2>&1", vol);
+            run(cmd);
+            fprintf(stderr, "step=%d vol=%d%% (d=%d)\n", cur_step, vol, d);
+            if (prev >= 0) play(cur_step > prev ? "vol_up.wav" : "vol_down.wav");
         }
-
-        last_d = d;
-        last_t = t;
     }
     return 0;
 }

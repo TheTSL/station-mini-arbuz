@@ -1,0 +1,12 @@
+#!/bin/sh
+case "$1" in
+  start)
+    (
+      sleep 20
+      while true; do
+        /data/opt/station-report.sh
+        sleep 15
+      done
+    ) >/dev/null 2>&1 &
+    ;;
+esac

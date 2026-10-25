@@ -1,0 +1,23 @@
+#!/bin/sh
+# Start the gesture volume daemon only in maind-free mode; stop it in Alice mode.
+case "$1" in
+  start)
+    (
+      sleep 25
+      while true; do
+        if ps | grep -q '[m]aind --platformd'; then
+          killall volgest 2>/dev/null
+        else
+          if ! ps | grep -q '[v]olgest'; then
+            chmod 755 /tmp/volgest 2>/dev/null
+            [ -x /tmp/volgest ] || { cp -f /data/opt/volgest /tmp/volgest && chmod 755 /tmp/volgest; }
+            [ -x /tmp/pcm_play ] || { cp -f /data/opt/pcm_play /tmp/pcm_play && chmod 755 /tmp/pcm_play; }
+            echo 1 > /sys/class/input/event0/device/enable_ps_sensor 2>/dev/null
+            setsid /tmp/volgest /dev/input/event0 >/dev/null 2>&1 &
+          fi
+        fi
+        sleep 10
+      done
+    ) >/dev/null 2>&1 &
+    ;;
+esac

@@ -1,0 +1,71 @@
+﻿#!/bin/sh
+# Collect station status and post it to the VPS panel; apply mode switch.
+PANEL="https://PANEL_HOST:PORT/station"
+TOKEN="CHANGE_ME_TOKEN"
+OUT=/tmp/station-report.json
+Q=/system/vendor/quasar
+ALICE_TPL=/data/local/tmp/backup_q/launch.alice.json
+LAST_SWITCH=/tmp/last_switch
+
+amx() {
+    LD_LIBRARY_PATH=/system/vendor/quasar/libs /system/workdir/bin/amixer "$@" 2>/dev/null
+}
+b() { [ "$1" = "1" ] && echo true || echo false; }
+
+VER=$(cat $Q/version_full 2>/dev/null | tr -d '\n')
+UP=$(cut -d. -f1 /proc/uptime)
+UP_H=$((UP / 3600)); UP_M=$(((UP % 3600) / 60))
+UPTIME="${UP_H}h ${UP_M}m"
+
+MEMFREE=$(( $(awk '/MemFree/{print $2}' /proc/meminfo) / 1024 ))
+LOAD=$(cut -d' ' -f1-3 /proc/loadavg)
+
+if ps | grep -q '[m]aind --platformd'; then PD=1; else PD=0; fi
+if ps | grep -q '[m]aind --mediad'; then MD=1; else MD=0; fi
+if ps | grep -q '[v]olgest'; then VG=1; else VG=0; fi
+if [ "$PD" = "1" ] || [ "$MD" = "1" ]; then MODE="normal"; else MODE="maind-free"; fi
+
+if netstat -ln 2>/dev/null | grep -q ':5555'; then ADB=1; else ADB=0; fi
+if netstat -ln 2>/dev/null | grep -q ':2222'; then SSH=1; else SSH=0; fi
+
+VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]')
+MUTE=$(amx -c 0 sget 'SPK mute' | grep -oE '\[(on|off)\]' | head -1 | tr -d '[]')
+
+SSID=$(iw dev wlan0 link 2>/dev/null | awk '/SSID/{print $2; exit}')
+SIG=$(iw dev wlan0 link 2>/dev/null | awk '/signal/{print $2" "$3; exit}')
+
+TEMP=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+if [ -n "$TEMP" ]; then TEMP=$((TEMP / 1000)); else TEMP=""; fi
+
+DIST=$(cat /tmp/volgest.dist 2>/dev/null)
+
+cat > "$OUT" <<EOF
+{"model":"YNDX-0004 / yandexmini","version":"$VER","mode":"$MODE","uptime":"$UPTIME","mem_free":"${MEMFREE} MB","load":"$LOAD","maind_platformd":$(b $PD),"maind_mediad":$(b $MD),"adb":$(b $ADB),"ssh":$(b $SSH),"volume":"$VOL","mute":"$MUTE","wifi_ssid":"$SSID","wifi_signal":"$SIG","temp":"${TEMP}C","volgest":$(b $VG),"distance":"$DIST mm"}
+EOF
+
+wget -q -O /dev/null --no-check-certificate \
+    --header="Content-Type: application/json" \
+    --post-file="$OUT" "$PANEL/api/report?t=$TOKEN" 2>/dev/null
+
+# --- СЂРµР¶РёРј: alice / custom ---
+CTRL=$(wget -q -O - --no-check-certificate "$PANEL/api/control?t=$TOKEN" 2>/dev/null)
+TARGET=$(echo "$CTRL" | sed -n 's/.*"desired":"\([a-z]*\)".*/\1/p')
+
+if [ -n "$TARGET" ] && [ "$TARGET" != "$MODE" ]; then
+    NOW=$(cut -d. -f1 /proc/uptime)
+    LAST=0
+    [ -f "$LAST_SWITCH" ] && LAST=$(cat "$LAST_SWITCH" 2>/dev/null)
+    if [ $((NOW - LAST)) -gt 240 ]; then
+        echo "$NOW" > "$LAST_SWITCH"
+        if [ "$TARGET" = "alice" ] && [ -f "$ALICE_TPL" ]; then
+            cp -f "$ALICE_TPL" $Q/launch.json
+            sync
+            (sleep 5; reboot) >/dev/null 2>&1 &
+        elif [ "$TARGET" = "custom" ]; then
+            printf '{\n    "nodes": [\n        { "name": "main", "root": ".", "tasks": [] }\n    ]\n}\n' > $Q/launch.json
+            sync
+            (sleep 5; reboot) >/dev/null 2>&1 &
+        fi
+    fi
+fi
+
