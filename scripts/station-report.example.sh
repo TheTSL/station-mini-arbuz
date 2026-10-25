@@ -31,8 +31,21 @@ if grep -q 'quasar/maind' $Q/launch.json 2>/dev/null; then CFG_MODE="normal"; el
 if netstat -ln 2>/dev/null | grep -q ':5555'; then ADB=1; else ADB=0; fi
 if netstat -ln 2>/dev/null | grep -q ':2222'; then SSH=1; else SSH=0; fi
 
-VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]')
-MUTE=$(amx -c 0 sget 'SPK mute' | grep -oE '\[(on|off)\]' | head -1 | tr -d '[]')
+# РњРёРєС€РµСЂ РѕРїСЂР°С€РёРІР°РµРј СЂРµРґРєРѕ (СЂР°Р· РІ 30 СЃ): С‡Р°СЃС‚РѕРµ РѕС‚РєСЂС‹С‚РёРµ ALSA-РєРѕРЅС‚СЂРѕР»РѕРІ
+# РЅР° СЌС‚РѕР№ РїСЂРѕС€РёРІРєРµ РґР°С‘С‚ С‰РµР»С‡РєРё РІ Р·РІСѓРєРµ.
+AMX_TS=/tmp/amixer_ts
+CUR_TS=$(date +%s)
+LAST_TS=$(cat $AMX_TS 2>/dev/null || echo 0)
+if [ "$CFG_MODE" = "custom" ] && [ $((CUR_TS - LAST_TS)) -gt 30 ]; then
+    VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]')
+    MUTE=$(amx -c 0 sget 'SPK mute' | grep -oE '\[(on|off)\]' | head -1 | tr -d '[]')
+    echo "$VOL" > /tmp/vol.cache
+    echo "$MUTE" > /tmp/mute.cache
+    echo "$CUR_TS" > $AMX_TS
+else
+    VOL=$(cat /tmp/vol.cache 2>/dev/null)
+    MUTE=$(cat /tmp/mute.cache 2>/dev/null)
+fi
 
 SSID=$(iw dev wlan0 link 2>/dev/null | awk '/SSID/{print $2; exit}')
 SIG=$(iw dev wlan0 link 2>/dev/null | awk '/signal/{print $2" "$3; exit}')

@@ -16,11 +16,11 @@
 
 #define MUTE_MM      100
 #define MUTE_HOLD_MS 900
-#define MIN_MM       120
-#define MAX_MM       420
+#define MIN_MM       150
+#define MAX_MM       400
 #define STEP_MM      15
 #define MAX_STEP     19
-#define OUT_MM       450
+#define OUT_MM       400
 #define SETTLE_MS    200
 
 #define PLAYER "/tmp/pcm_play hw:0,0 /bkupgrade/snd/"
