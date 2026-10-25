@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 import time
 
@@ -8,6 +8,15 @@ BASE = "/opt/station-panel"
 TOKEN = open(os.path.join(BASE, "token")).read().strip()
 STATE_FILE = os.path.join(BASE, "state.json")
 MODE_FILE = os.path.join(BASE, "desired_mode")
+VOL_FILE = os.path.join(BASE, "desired_volume")
+MUTE_FILE = os.path.join(BASE, "desired_mute")
+
+
+def read_text(path):
+    try:
+        return open(path).read().strip()
+    except Exception:
+        return ""
 
 app = Flask(__name__)
 
@@ -53,7 +62,9 @@ def report():
 def control():
     if request.args.get("t") != TOKEN:
         return jsonify(error="forbidden"), 403
-    return jsonify(desired=load_mode())
+    return jsonify(desired=load_mode(),
+                   volume=read_text(VOL_FILE),
+                   mute=read_text(MUTE_FILE))
 
 
 @app.route("/api/mode", methods=["POST"])
@@ -68,6 +79,70 @@ def set_mode():
     return jsonify(ok=True, mode=m)
 
 
+def auth_ok():
+    t = request.args.get("t") or request.headers.get("X-Auth-Token", "")
+    return t == TOKEN
+
+
+@app.route("/api/v1/health")
+def v1_health():
+    if not auth_ok():
+        return jsonify(error="forbidden"), 403
+    return jsonify(ok=True, ts=int(time.time()))
+
+
+@app.route("/api/v1/status")
+def v1_status():
+    if not auth_ok():
+        return jsonify(error="forbidden"), 403
+    d = load_state()
+    d["desired"] = load_mode()
+    d["desired_volume"] = read_text(VOL_FILE)
+    d["desired_mute"] = read_text(MUTE_FILE)
+    d["now"] = int(time.time())
+    return jsonify(d)
+
+
+@app.route("/api/v1/mode", methods=["POST"])
+def v1_mode():
+    if not auth_ok():
+        return jsonify(error="forbidden"), 403
+    data = request.get_json(force=True, silent=True) or {}
+    m = data.get("mode", "")
+    if m not in ("alice", "custom"):
+        return jsonify(error="mode must be alice|custom"), 400
+    save_mode(m)
+    return jsonify(ok=True, mode=m)
+
+
+@app.route("/api/v1/volume", methods=["POST"])
+def v1_volume():
+    if not auth_ok():
+        return jsonify(error="forbidden"), 403
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        v = int(data.get("value"))
+    except Exception:
+        return jsonify(error="value must be int 0..100"), 400
+    v = max(0, min(100, v))
+    with open(VOL_FILE, "w") as f:
+        f.write(str(v))
+    return jsonify(ok=True, volume=v)
+
+
+@app.route("/api/v1/mute", methods=["POST"])
+def v1_mute():
+    if not auth_ok():
+        return jsonify(error="forbidden"), 403
+    data = request.get_json(force=True, silent=True) or {}
+    m = str(data.get("value", "")).lower()
+    if m not in ("on", "off"):
+        return jsonify(error="value must be on|off"), 400
+    with open(MUTE_FILE, "w") as f:
+        f.write(m)
+    return jsonify(ok=True, mute=m)
+
+
 @app.route("/api/state")
 def state():
     d = load_state()
@@ -78,7 +153,7 @@ def state():
 
 PAGE = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<title>РЎС‚Р°РЅС†РёСЏ</title>
+<title>Станция</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
  body{background:#0f1216;color:#e6edf3;font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
@@ -98,25 +173,25 @@ PAGE = """<!doctype html>
  @keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
 </style></head><body>
 <h1>Yandex Station Mini 1</h1>
-<div class="sub">РњРѕРґРµР»СЊ <b id="model">вЂ”</b>, РїСЂРѕС€РёРІРєР° <b id="ver">вЂ”</b></div>
+<div class="sub">Модель <b id="model">—</b>, прошивка <b id="ver">—</b></div>
 
 <div class="row">
-  <button id="b_alice" onclick="setMode('alice')">Р РµР¶РёРј РђР»РёСЃС‹</button>
-  <button id="b_custom" onclick="setMode('custom')">РЎРІРѕР№ СЂРµР¶РёРј</button>
+  <button id="b_alice" onclick="setMode('alice')">Режим Алисы</button>
+  <button id="b_custom" onclick="setMode('custom')">Свой режим</button>
 </div>
 
 <div class="grid" id="g"></div>
-<div class="foot"><span class="dot"></span><span id="f">РѕР¶РёРґР°РЅРёРµ РґР°РЅРЅС‹С…вЂ¦</span></div>
+<div class="foot"><span class="dot"></span><span id="f">ожидание данных…</span></div>
 
 <script>
 const TOKEN = "__TOKEN__";
 const cards = [
-  ["Р РµР¶РёРј", "mode"], ["Uptime", "uptime"], ["РЎРІРѕР±РѕРґРЅРѕ RAM", "mem_free"], ["Load", "load"],
+  ["Режим", "mode"], ["Uptime", "uptime"], ["Свободно RAM", "mem_free"], ["Load", "load"],
   ["platformd", "maind_platformd"], ["mediad", "maind_mediad"],
   ["ADB :5555", "adb"], ["SSH :2222", "ssh"],
-  ["Р“СЂРѕРјРєРѕСЃС‚СЊ", "volume"], ["Mute", "mute"],
-  ["Wi-Fi", "wifi_ssid"], ["РЎРёРіРЅР°Р»", "wifi_signal"], ["РўРµРјРїРµСЂР°С‚СѓСЂР°", "temp"],
-  ["Р”Р°С‚С‡РёРє", "distance"], ["Р–РµСЃС‚-РґРµРјРѕРЅ", "volgest"]
+  ["Громкость", "volume"], ["Mute", "mute"],
+  ["Wi-Fi", "wifi_ssid"], ["Сигнал", "wifi_signal"], ["Температура", "temp"],
+  ["Датчик", "distance"], ["Жест-демон", "volgest"]
 ];
 function cls(v){
   if (v === true || v === "on") return "ok";
@@ -124,13 +199,13 @@ function cls(v){
   return "";
 }
 function render(d){
-  document.getElementById("model").textContent = d.model || "вЂ”";
-  document.getElementById("ver").textContent = d.version || "вЂ”";
+  document.getElementById("model").textContent = d.model || "—";
+  document.getElementById("ver").textContent = d.version || "—";
   const g = document.getElementById("g"); g.innerHTML = "";
   for (const [label, key] of cards){
     let v = d[key];
     if (v === undefined || v === null) continue;
-    if (typeof v === "boolean") v = v ? "РґР°" : "РЅРµС‚";
+    if (typeof v === "boolean") v = v ? "да" : "нет";
     const c = document.createElement("div"); c.className = "card";
     c.innerHTML = `<div class="k">${label}</div><div class="v ${cls(d[key])}">${v}</div>`;
     g.appendChild(c);
@@ -138,9 +213,9 @@ function render(d){
   document.getElementById("b_alice").className  = d.mode === "normal" ? "on" : "";
   document.getElementById("b_custom").className = d.mode === "maind-free" ? "on" : "";
   const age = d._ts ? Math.round(Date.now()/1000 - d._ts) : null;
-  const des = d.desired ? ` В· Р·Р°РїСЂРѕС€РµРЅРѕ: ${d.desired}` : "";
+  const des = d.desired ? ` · запрошено: ${d.desired}` : "";
   document.getElementById("f").textContent =
-    (age === null ? "РЅРµС‚ РґР°РЅРЅС‹С…" : `РѕР±РЅРѕРІР»РµРЅРѕ ${age} СЃ РЅР°Р·Р°Рґ`) + des;
+    (age === null ? "нет данных" : `обновлено ${age} с назад`) + des;
 }
 async function tick(){
   try{
@@ -166,4 +241,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8448)
-

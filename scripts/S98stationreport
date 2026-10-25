@@ -2,10 +2,10 @@
 case "$1" in
   start)
     (
-      sleep 20
+      sleep 15
       while true; do
         /data/opt/station-report.sh
-        sleep 15
+        sleep 3
       done
     ) >/dev/null 2>&1 &
     ;;
