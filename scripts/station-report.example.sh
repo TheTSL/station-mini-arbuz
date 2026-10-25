@@ -1,5 +1,5 @@
 ﻿#!/bin/sh
-# Collect station status and post it to the VPS panel; apply mode switch.
+# Collect station status, post it to the VPS API, apply remote commands.
 PANEL="https://PANEL_HOST:PORT/station"
 TOKEN="CHANGE_ME_TOKEN"
 OUT=/tmp/station-report.json
@@ -47,9 +47,21 @@ wget -q -O /dev/null --no-check-certificate \
     --header="Content-Type: application/json" \
     --post-file="$OUT" "$PANEL/api/report?t=$TOKEN" 2>/dev/null
 
-# --- СЂРµР¶РёРј: alice / custom ---
+# --- РєРѕРјР°РЅРґС‹ СЃ Р±РѕС‚Р°/РїР°РЅРµР»Рё ---
 CTRL=$(wget -q -O - --no-check-certificate "$PANEL/api/control?t=$TOKEN" 2>/dev/null)
 TARGET=$(echo "$CTRL" | sed -n 's/.*"desired":"\([a-z]*\)".*/\1/p')
+VOL_T=$(echo "$CTRL" | sed -n 's/.*"volume":"\([0-9]*\)".*/\1/p')
+MUTE_T=$(echo "$CTRL" | sed -n 's/.*"mute":"\([a-z]*\)".*/\1/p')
+
+if [ -n "$VOL_T" ]; then
+    CUR_VOL=$(echo "$VOL" | tr -d '%')
+    if [ "$VOL_T" != "$CUR_VOL" ]; then
+        amx -c 0 sset 'Master' "${VOL_T}%" >/dev/null 2>&1
+    fi
+fi
+if [ -n "$MUTE_T" ] && [ "$MUTE_T" != "$MUTE" ]; then
+    amx -c 0 sset 'SPK mute' "$MUTE_T" >/dev/null 2>&1
+fi
 
 if [ -n "$TARGET" ] && [ "$TARGET" != "$MODE" ]; then
     NOW=$(cut -d. -f1 /proc/uptime)
