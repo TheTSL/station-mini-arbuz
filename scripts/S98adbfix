@@ -1,0 +1,16 @@
+#!/bin/sh
+# Автозапуск adbd при загрузке + сторож.
+# /etc/init.d/S98adbfix
+case "$1" in
+  start)
+    /system/vendor/quasar/activate_adb.sh check >/dev/null 2>&1
+    (
+      while true; do
+        sleep 120
+        if ! ps -A 2>/dev/null | grep -q "[a]dbd"; then
+          /system/vendor/quasar/activate_adb.sh check >/dev/null 2>&1
+        fi
+      done
+    ) >/dev/null 2>&1 &
+    ;;
+esac

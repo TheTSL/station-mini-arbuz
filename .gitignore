@@ -1,0 +1,21 @@
+# секреты и личные данные — не коммитить
+*.key
+*.pem
+certs/
+leaf.key
+chain.pem
+account_storage.dat
+*.log
+logs/
+captures/
+recordings/
+*.wav
+*.mp3
+*.m4a
+*.opus
+
+# сборка
+*.o
+*.a
+pcm_play
+build/
