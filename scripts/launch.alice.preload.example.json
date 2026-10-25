@@ -1,0 +1,32 @@
+{
+    "nodes": [
+        {
+            "name": "main",
+            "root": ".",
+            "tasks": [
+                {
+                    "name": "maind",
+                    "delay": 5,
+                    "allowedRestartIntervalSeconds": 10,
+                    "root": ".",
+                    "path": "/system/vendor/quasar/maind",
+                    "arg": ["--platformd"],
+                    "envs": ["MALLOC_ARENA_MAX=2", "CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt", "LD_PRELOAD=/data/opt/libi2clog.so"],
+                    "order": 1,
+                    "log": false
+                },
+                {
+                    "name": "mediad",
+                    "delay": 5,
+                    "allowedRestartIntervalSeconds": 600,
+                    "root": ".",
+                    "path": "/system/vendor/quasar/maind",
+                    "arg": ["--mediad"],
+                    "envs": ["MALLOC_ARENA_MAX=2", "CA_CERTIFICATES=/system/vendor/quasar/ca-certificates.crt", "LD_PRELOAD=/data/opt/libi2clog.so"],
+                    "order": 3,
+                    "log": false
+                }
+            ]
+        }
+    ]
+}
