@@ -83,6 +83,20 @@ int main(int argc, char **argv)
         write_regs(fd, 0x00, pwm, 36);
         write_reg(fd, 0x27, 0x00);
         printf("pwm=%d\n", v);
+    } else if (!strcmp(cmd, "mask")) {
+        /* mask <start> <end> <val> [cur] — пакетная запись: только каналы start..end */
+        if (argc < 7) { fprintf(stderr, "mask <start> <end> <val> [cur]\n"); close(fd); return 1; }
+        int s0 = atoi(argv[4]), e0 = atoi(argv[5]), val = atoi(argv[6]);
+        int cur = (argc > 7) ? (int)strtol(argv[7], NULL, 0) : 0x40;
+        unsigned char pwm[36];
+        memset(pwm, 0, sizeof(pwm));
+        for (int i = s0; i <= e0 && i < 36; i++) pwm[i] = (unsigned char)val;
+        write_regs(fd, 0x00, pwm, 36);
+        write_reg(fd, 0x24, (unsigned char)cur);
+        write_reg(fd, 0x25, 0x01);
+        write_reg(fd, 0x26, 0x00);
+        write_reg(fd, 0x27, 0x00);
+        printf("mask %d..%d = %d (cur=%d)\n", s0, e0, val, cur);
     } else if (!strcmp(cmd, "color")) {
         /* color <r> <g> <b> [current] — одинаковый цвет на всех светодиодах */
         if (argc < 7) { fprintf(stderr, "color <r> <g> <b> [cur]\n"); close(fd); return 1; }
@@ -94,8 +108,10 @@ int main(int argc, char **argv)
             pwm[i*3+1] = (unsigned char)g;
             pwm[i*3+2] = (unsigned char)b;
         }
-        write_reg(fd, 0x24, (unsigned char)cur);
         write_regs(fd, 0x00, pwm, 36);
+        write_reg(fd, 0x24, (unsigned char)cur);
+        write_reg(fd, 0x25, 0x01);
+        write_reg(fd, 0x26, 0x00);
         write_reg(fd, 0x27, 0x00);
         printf("color r=%d g=%d b=%d cur=%d\n", r, g, b, cur);
     } else if (!strcmp(cmd, "off")) {
