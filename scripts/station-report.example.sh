@@ -36,7 +36,7 @@ if netstat -ln 2>/dev/null | grep -q ':2222'; then SSH=1; else SSH=0; fi
 AMX_TS=/tmp/amixer_ts
 CUR_TS=$(date +%s)
 LAST_TS=$(cat $AMX_TS 2>/dev/null || echo 0)
-if [ $((CUR_TS - LAST_TS)) -gt 30 ] && [ "$UP" -gt 90 ]; then
+if [ "$CFG_MODE" = "custom" ] && [ $((CUR_TS - LAST_TS)) -gt 30 ] && [ "$UP" -gt 90 ]; then
     VOL=$(amx -c 0 sget Master | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]')
     MUTE=$(amx -c 0 sget 'SPK mute' | grep -oE '\[(on|off)\]' | head -1 | tr -d '[]')
     echo "$VOL" > /tmp/vol.cache

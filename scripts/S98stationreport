@@ -2,18 +2,18 @@
 case "$1" in
   start)
     (
-      sleep 20
+      sleep 30
       # ждём, пока maind поднимется (режим Алисы), но не дольше ~70 с
       i=0
-      while [ $i -lt 50 ]; do
+      while [ $i -lt 40 ]; do
         if ps | grep -q '[m]aind --platformd'; then break; fi
         sleep 2
         i=$((i+2))
       done
-      sleep 10
+      sleep 20
       while true; do
         /data/opt/station-report.sh
-        sleep 3
+        sleep 15
       done
     ) >/dev/null 2>&1 &
     ;;
