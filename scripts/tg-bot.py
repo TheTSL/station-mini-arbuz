@@ -16,6 +16,7 @@ STATION_TOKEN = open(os.path.join(BASE_DIR, "station_token")).read().strip()
 STATION_HEADERS = {"X-Auth-Token": STATION_TOKEN}
 HTTP = requests.Session()
 VOLUME_QUEUE = queue.Queue()
+BLUETOOTH_QUEUE = queue.Queue()
 
 STATE = os.path.join(PANEL_DIR, "state.json")
 MODE = os.path.join(PANEL_DIR, "desired_mode")
@@ -42,12 +43,15 @@ def write(path, value):
         endpoint, payload = "volume", {"value": int(value)}
     elif path == MUTE:
         endpoint, payload = "mute", {"value": str(value)}
+    elif path == "bluetooth":
+        endpoint, payload = "bluetooth", {"value": str(value)}
     else:
         endpoint = None
     if endpoint:
         try:
+            timeout = (2, 35) if endpoint == "bluetooth" else (2, 4)
             r = HTTP.post(STATION_API + "/" + endpoint,
-                          headers=STATION_HEADERS, json=payload, timeout=(2, 4))
+                          headers=STATION_HEADERS, json=payload, timeout=timeout)
             r.raise_for_status()
             return True
         except requests.RequestException:
@@ -92,6 +96,34 @@ def volume_loop():
             traceback.print_exc()
         finally:
             VOLUME_QUEUE.task_done()
+
+
+def apply_bluetooth(chat_id, message_id, value, markup):
+    if not write("bluetooth", value):
+        send(chat_id, "⚠️ Не удалось переключить Bluetooth на колонке.")
+        return
+    if markup:
+        for row in markup.get("inline_keyboard", []):
+            for button in row:
+                if button.get("callback_data", "").startswith("bluetooth:"):
+                    enabled = value == "on"
+                    button["text"] = "🔵 Bluetooth: выкл" if enabled else "🔵 Bluetooth: вкл"
+                    button["callback_data"] = "bluetooth:off" if enabled else "bluetooth:on"
+        tg("editMessageReplyMarkup", chat_id=chat_id,
+           message_id=message_id, reply_markup=json.dumps(markup))
+    if value == "on":
+        send(chat_id, "Bluetooth-аудиоприёмник включён. Ищи колонку в списке устройств как `linkplaybt_demo`.")
+
+
+def bluetooth_loop():
+    while True:
+        chat_id, message_id, value, markup = BLUETOOTH_QUEUE.get()
+        try:
+            apply_bluetooth(chat_id, message_id, value, markup)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            BLUETOOTH_QUEUE.task_done()
 
 
 def state():
@@ -141,8 +173,7 @@ def keyboard(d=None):
     alice_mark = "✓ " if mode == "normal" else ""
     custom_mark = "✓ " if mode == "maind-free" else ""
     mute_btn = "🔊 Unmute" if mute == "on" else "🔇 Mute"
-    return {
-        "inline_keyboard": [
+    rows = [
             [{"text": f"{alice_mark}Алиса", "callback_data": "mode:alice"},
              {"text": f"{custom_mark}Свой режим", "callback_data": "mode:custom"}],
             [{"text": "−10", "callback_data": "vol:-10"},
@@ -152,8 +183,12 @@ def keyboard(d=None):
             [{"text": "🔄 Обновить", "callback_data": "status"},
              {"text": "⏱ Живой режим", "callback_data": "live"},
              {"text": "⏹ Стоп", "callback_data": "stop"}],
-        ]
-    }
+    ]
+    if mode == "maind-free":
+        bt_on = bool(d.get("bluetooth"))
+        rows.insert(2, [{"text": "🔵 Bluetooth: выкл" if bt_on else "🔵 Bluetooth: вкл",
+                         "callback_data": "bluetooth:off" if bt_on else "bluetooth:on"}])
+    return {"inline_keyboard": rows}
 
 
 def tg(method, **kwargs):
@@ -271,6 +306,7 @@ def handle(chat_id, text):
 def main():
     threading.Thread(target=live_loop, daemon=True).start()
     threading.Thread(target=volume_loop, daemon=True).start()
+    threading.Thread(target=bluetooth_loop, daemon=True).start()
     offset = 0
     while True:
         try:
@@ -311,6 +347,13 @@ def main():
                             markup = json.loads(json.dumps(markup))
                         VOLUME_QUEUE.put((chat_id, msg_id, delta, markup))
                         answer_cb(cq["id"], "Команда отправляется на колонку…")
+                    elif cb.startswith("bluetooth:"):
+                        value = cb.split(":", 1)[1]
+                        markup = cq["message"].get("reply_markup")
+                        if markup:
+                            markup = json.loads(json.dumps(markup))
+                        BLUETOOTH_QUEUE.put((chat_id, msg_id, value, markup))
+                        answer_cb(cq["id"], "Переключаю Bluetooth…")
                     elif cb.startswith("mute:"):
                         m = cb.split(":", 1)[1]
                         ok = write(MUTE, m)

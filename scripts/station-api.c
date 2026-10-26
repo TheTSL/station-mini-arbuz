@@ -5,13 +5,18 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <pty.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -29,6 +34,10 @@ static int volume_cache = -1;
 static time_t volume_checked;
 static char mute_cache[8] = "";
 static time_t mute_checked;
+static int bluetooth_master = -1;
+static pid_t bluetooth_pid = -1;
+static pthread_t bluetooth_reader;
+static int bluetooth_reader_started;
 static void response(int fd, int code, const char *body);
 
 static void read_text(const char *path, char *out, size_t cap)
@@ -56,6 +65,169 @@ static int process_running(const char *needle)
         if (!strcmp(name, needle)) { closedir(dir); return 1; }
     }
     closedir(dir);
+    return 0;
+}
+
+static void kill_named(const char *needle, int signal_number)
+{
+    DIR *dir = opendir("/proc");
+    struct dirent *ent;
+    if (!dir) return;
+    while ((ent = readdir(dir))) {
+        char path[128], name[128];
+        pid_t pid;
+        if (!isdigit((unsigned char)ent->d_name[0])) continue;
+        pid = (pid_t)atoi(ent->d_name);
+        if (pid == getpid()) continue;
+        snprintf(path, sizeof(path), "/proc/%.20s/comm", ent->d_name);
+        read_text(path, name, sizeof(name));
+        if (!strcmp(name, needle)) kill(pid, signal_number);
+    }
+    closedir(dir);
+}
+
+static int bluetooth_read_until(int fd, const char *needle, int timeout_seconds)
+{
+    char buf[2048] = {0};
+    size_t used = 0;
+    struct timeval start, now;
+    gettimeofday(&start, NULL);
+    for (;;) {
+        fd_set set;
+        struct timeval wait = {.tv_sec = 0, .tv_usec = 200000};
+        FD_ZERO(&set); FD_SET(fd, &set);
+        int ready = select(fd + 1, &set, NULL, NULL, &wait);
+        if (ready > 0) {
+            char chunk[512];
+            ssize_t n = read(fd, chunk, sizeof(chunk));
+            if (n <= 0) return -1;
+            if (used + (size_t)n >= sizeof(buf)) {
+                size_t drop = used + (size_t)n - sizeof(buf) + 1;
+                memmove(buf, buf + drop, used - drop);
+                used -= drop;
+            }
+            memcpy(buf + used, chunk, (size_t)n); used += (size_t)n;
+            buf[used] = 0;
+            if (strstr(buf, needle)) return 0;
+        } else if (ready < 0 && errno != EINTR) return -1;
+        gettimeofday(&now, NULL);
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000L +
+                       (now.tv_usec - start.tv_usec) / 1000L;
+        if (elapsed >= timeout_seconds * 1000L) return -1;
+    }
+}
+
+static void *bluetooth_drain(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    char buf[512];
+    FILE *log = fopen("/tmp/station-bt.log", "ab");
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        if (log) { fwrite(buf, 1, (size_t)n, log); fflush(log); }
+    }
+    if (log) fclose(log);
+    return NULL;
+}
+
+static int bluetooth_start(void)
+{
+    int master, errfd, stage = 1;
+    pid_t pid;
+    int child_status;
+    if (bluetooth_pid > 0 && waitpid(bluetooth_pid, &child_status, WNOHANG) == bluetooth_pid) {
+        bluetooth_pid = -1;
+        if (bluetooth_master >= 0) { close(bluetooth_master); bluetooth_master = -1; }
+    }
+    if (process_running("bt_demo")) return 0;
+    pid = forkpty(&master, NULL, NULL, NULL);
+    if (pid < 0) {
+        FILE *f = fopen("/tmp/station-bt-start.fail", "w");
+        if (f) { fprintf(f, "forkpty: %d\n", errno); fclose(f); }
+        return -1;
+    }
+    if (pid == 0) {
+        errfd = open("/tmp/station-bt-start.err", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (errfd >= 0) dup2(errfd, STDERR_FILENO);
+        if (chdir("/system/workdir") != 0) { perror("bt_demo chdir"); _exit(126); }
+        setenv("WORKDIR", "/system/workdir", 1);
+        setenv("LD_LIBRARY_PATH", "/system/workdir/lib:/system/vendor/quasar/libs", 1);
+        setenv("ALSA_CONFIG_DIR", "/tmp/alsa", 1);
+        setenv("ALSA_CONFIG_PATH", "/tmp/alsa/alsa.conf", 1);
+        setenv("MPLAYER_HOME", "/tmp", 1);
+        setenv("PATH", "/sbin:/usr/sbin:/bin:/usr/bin:/system/workdir/bin:/system/workdir/user:/system/vendor/quasar", 1);
+        setenv("LANG", "UTF-8", 1);
+        setenv("CHARSET", "UTF-8", 1);
+        execl("/bin/sh", "sh", "-c",
+              ". ./evn_amlogic.sh >/dev/null 2>&1; export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/system/vendor/quasar/libs; exec ./bin/bt_demo",
+              (char *)NULL);
+        perror("bt_demo shell exec");
+        _exit(127);
+    }
+    bluetooth_pid = pid;
+    stage = 1;
+    if (bluetooth_read_until(master, "Select action =>", 10) != 0) goto bt_fail;
+    stage = 2;
+    if (write(master, "1\n", 2) != 2) goto bt_fail;
+    stage = 3;
+    if (bluetooth_read_until(master, "Select action =>", 5) != 0) goto bt_fail;
+    stage = 4;
+    if (write(master, "3\n", 2) != 2) goto bt_fail;
+    stage = 5;
+    if (bluetooth_read_until(master, "Choose discoverable", 5) != 0) goto bt_fail;
+    stage = 6;
+    if (write(master, "1\n", 2) != 2) goto bt_fail;
+    stage = 7;
+    if (bluetooth_read_until(master, "Choose connectable", 5) != 0) goto bt_fail;
+    stage = 8;
+    if (write(master, "1\n", 2) != 2) goto bt_fail;
+    stage = 9;
+    if (bluetooth_read_until(master, "Select action =>", 5) != 0) goto bt_fail;
+    stage = 10;
+    if (!process_running("bt_demo")) goto bt_fail;
+    goto bt_ready;
+bt_fail:
+    {
+        FILE *f = fopen("/tmp/station-bt-start.fail", "w");
+        if (f) { fprintf(f, "stage=%d errno=%d\n", stage, errno); fclose(f); }
+        kill(pid, SIGTERM); kill_named("bsa_server", SIGTERM);
+        waitpid(pid, NULL, 0); bluetooth_pid = -1; close(master); return -1;
+    }
+bt_ready:
+    bluetooth_master = master;
+    if (pthread_create(&bluetooth_reader, NULL, bluetooth_drain,
+                       (void *)(intptr_t)master) != 0) {
+        kill(pid, SIGTERM); kill_named("bsa_server", SIGTERM);
+        waitpid(pid, NULL, 0); bluetooth_pid = -1; close(master); bluetooth_master = -1;
+        return -1;
+    }
+    bluetooth_reader_started = 1;
+    return master;
+}
+
+static int bluetooth_set(int enabled)
+{
+    if (enabled) {
+        int master = bluetooth_start();
+        if (master < 0) return -1;
+        return 0;
+    }
+    if (bluetooth_pid > 0) kill(bluetooth_pid, SIGTERM);
+    kill_named("bt_demo", SIGTERM);
+    kill_named("bsa_server", SIGTERM);
+    usleep(300000);
+    if (bluetooth_pid > 0) kill(bluetooth_pid, SIGKILL);
+    kill_named("bt_demo", SIGKILL);
+    kill_named("bsa_server", SIGKILL);
+    if (bluetooth_pid > 0) { waitpid(bluetooth_pid, NULL, 0); bluetooth_pid = -1; }
+    if (bluetooth_reader_started) {
+        pthread_join(bluetooth_reader, NULL);
+        bluetooth_reader_started = 0;
+    }
+    if (bluetooth_master >= 0) { close(bluetooth_master); bluetooth_master = -1; }
+    unlink("/tmp/bt-daemon-socket");
+    unlink("/tmp/bt-avk-fifo");
+    unlink("/tmp/loop_capture_pcm");
     return 0;
 }
 
@@ -280,10 +452,12 @@ static void status_response(int fd)
     snprintf(body, sizeof(body),
         "{\"model\":\"YNDX-0004\",\"version\":\"%.90s\",\"mode\":\"%s\","
         "\"volume\":\"%s\",\"mute\":\"%s\",\"uptime\":\"%ldh %ldm\",\"mem_free\":\"%ld MB\","
-        "\"adb\":true,\"ssh\":true,\"volgest\":%s,\"distance\":\"%d mm\","
+        "\"adb\":true,\"ssh\":true,\"bluetooth\":%s,\"volgest\":%s,\"distance\":\"%d mm\","
         "\"hand\":\"%.20s\",\"_ts\":%ld}",
         ver, alice ? "normal" : "maind-free", volume_text, alice ? "—" : read_mute(), seconds / 3600,
-        (seconds % 3600) / 60, free_kb / 1024, process_running("volgest") ? "true" : "false",
+        (seconds % 3600) / 60, free_kb / 1024,
+        process_running("bt_demo") ? "true" : "false",
+        process_running("volgest") ? "true" : "false",
         atoi(dist), hand, (long)time(NULL));
     response(fd, 200, body);
 }
@@ -343,6 +517,18 @@ static void handle(int fd)
         if (run_amixer("SPK mute", value) != 0) { response(fd, 500, "{\"error\":\"amixer failed\"}"); return; }
         strcpy(mute_cache, value); mute_checked = time(NULL);
         response(fd, 200, "{\"ok\":true}");
+    } else if (!strcmp(method, "POST") && !strcmp(path, "/api/v1/bluetooth")) {
+        if (alice_mode()) { response(fd, 403, "{\"error\":\"custom mode required\"}"); return; }
+        if (!json_value(body, "value", value, sizeof(value)) ||
+            (strcmp(value, "on") && strcmp(value, "off"))) {
+            response(fd, 400, "{\"error\":\"bluetooth must be on or off\"}"); return;
+        }
+        if (bluetooth_set(!strcmp(value, "on")) != 0) {
+            response(fd, 500, "{\"error\":\"bluetooth startup failed\"}"); return;
+        }
+        response(fd, 200, !strcmp(value, "on") ?
+                 "{\"ok\":true,\"bluetooth\":true}" :
+                 "{\"ok\":true,\"bluetooth\":false}");
     } else if (!strcmp(method, "POST") && !strcmp(path, "/api/v1/mode")) {
         if (!json_value(body, "mode", value, sizeof(value)) ||
             (strcmp(value, "alice") && strcmp(value, "custom"))) {
