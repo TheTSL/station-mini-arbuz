@@ -2,8 +2,8 @@
  * volgest.c — громкость жестом над VL53L0.
  *
  * Абсолютные пороги (по реальным замерам датчика):
- *   - красный/mute: датчик сообщает не более 90 мм (физический минимум около 88 мм)
- *   - зона громкости: 13..30 см, 40 уровней
+ *   - красный/mute: датчик сообщает не более 96 мм (нижний предел около 88 мм)
+ *   - зона громкости: примерно 15..30 см, 40 уровней с калибровочной кривой
  *   - гашение с задержкой 0.5 с, чтобы не мигало
  *
  * Громкость и mute задаются штатным amixer CLI. Кольцо пробуется через I2C,
@@ -22,11 +22,10 @@
 #include <linux/i2c-dev.h>
 #include <sys/wait.h>
 
-#define RED_MM       90     /* ближе — красный */
-#define RED_EXIT_MM  105     /* гистерезис выхода */
-#define MIN_MM       130     /* тихо */
-#define MAX_MM       300     /* громко */
-#define ZONE_EXIT_MM 350     /* выход из зоны */
+#define RED_MM       96     /* ближе — красный / начало mute */
+#define RED_EXIT_MM  105    /* гистерезис выхода */
+#define MAX_MM       350    /* дальняя граница рабочей зоны */
+#define ZONE_EXIT_MM 390    /* выход из зоны */
 #define LEVELS       40
 #define MUTE_HOLD_MS 700
 #define SETTLE_MS    50
@@ -78,6 +77,30 @@ static int set_volume(int pct)
     return amixer_command("Master", value);
 }
 
+static int step_for_distance(int mm)
+{
+    /* Эмпирические пары (мм показания -> %) для фактических расстояний
+       15/20/25/30 см. VL53L0 нелинеен в ближней зоне. */
+    static const int distance_mm[] = { 100, 145, 175, 320 };
+    static const int percent[] = { 0, 33, 66, 100 };
+    int pct = 0;
+
+    if (mm <= distance_mm[0])
+        return 0;
+    if (mm >= distance_mm[3])
+        return LEVELS;
+
+    for (size_t i = 1; i < sizeof(distance_mm) / sizeof(distance_mm[0]); i++) {
+        if (mm <= distance_mm[i]) {
+            pct = percent[i - 1] +
+                  (mm - distance_mm[i - 1]) * (percent[i] - percent[i - 1]) /
+                  (distance_mm[i] - distance_mm[i - 1]);
+            return (pct * LEVELS + 50) / 100;
+        }
+    }
+    return LEVELS;
+}
+
 static void toggle_mute(void)
 {
     const char *query =
@@ -119,11 +142,13 @@ static void led_bar(int n, int r, int g, int b)
 
 int main(int argc, char **argv)
 {
-    const char *dev = argc > 1 ? argv[1] : "/dev/input/event0";
+    const int calibration_mode = argc > 1 && !strcmp(argv[1], "--calibrate");
+    const char *dev = (!calibration_mode && argc > 1) ? argv[1] : "/dev/input/event0";
     int fd = open(dev, O_RDONLY);
     if (fd < 0) { perror("open"); return 1; }
 
-    i2c_fd = i2c_open_dev();
+    if (!calibration_mode)
+        i2c_fd = i2c_open_dev();
     struct input_event ev;
     double ema = -1;
     int last_written = -1;
@@ -132,7 +157,7 @@ int main(int argc, char **argv)
     int pending_vol = -1, applied_vol = -1;
     int bar_n = -1, shown = 0;
     long long cand_t = 0, near_since = 0, last_mute = 0, last_apply = 0;
-    long long zone_since = 0, last_near = 0;
+    long long zone_since = 0, last_near = 0, last_report = 0;
 
     while (1) {
         ssize_t n = read(fd, &ev, sizeof(ev));
@@ -153,6 +178,14 @@ int main(int argc, char **argv)
                 fclose(fp);
             }
             last_written = d;
+        }
+
+        if (calibration_mode) {
+            if (t - last_report >= 100) {
+                fprintf(stderr, "%lld raw=%d filtered=%d\n", t, raw, d);
+                last_report = t;
+            }
+            continue;
         }
 
         /* красный: рука у колонки, с гистерезисом */
@@ -192,10 +225,7 @@ int main(int argc, char **argv)
             }
 
             if (in_zone) {
-                int step;
-                if (d <= MIN_MM) step = 0;
-                else if (d >= MAX_MM) step = LEVELS;
-                else step = (d - MIN_MM) * LEVELS / (MAX_MM - MIN_MM);
+                int step = step_for_distance(d);
 
                 if (step != cand_step) { cand_step = step; cand_t = t; }
 
