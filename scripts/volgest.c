@@ -31,11 +31,12 @@
 #define FULL_TRAVEL_CM 15.0
 #define STEP_DEADBAND 2
 #define MUTE_HOLD_MS 700
-#define SETTLE_MS    120
+#define SETTLE_MS    50
 #define ZONE_MS      250
 #define HAND_LOST_MS 1000
 #define CLEAR_MS     500
-#define VOL_MS       100
+#define VOL_MS       60
+#define VOL_SLEW_PCT 5
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -79,6 +80,21 @@ static int set_volume(int pct)
     char value[16];
     snprintf(value, sizeof(value), "%d%%", pct);
     return amixer_command("Master", value);
+}
+
+static void set_hand_state(int state)
+{
+    static int previous = -1;
+    static const char *const labels[] = { "absent", "detecting", "present", "lost" };
+    if (state < 0 || state > 3 || state == previous) return;
+
+    FILE *fp = fopen("/tmp/volgest.hand", "w");
+    if (fp) {
+        fprintf(fp, "%s\n", labels[state]);
+        fclose(fp);
+    }
+    fprintf(stderr, "hand=%s\n", labels[state]);
+    previous = state;
 }
 
 static int read_volume(void)
@@ -213,6 +229,7 @@ int main(int argc, char **argv)
         }
 
         if (calibration_mode) {
+            set_hand_state(d <= MAX_MM ? 2 : 0);
             if (t - last_report >= 100) {
                 fprintf(stderr, "%lld raw=%d filtered=%d\n", t, raw, d);
                 last_report = t;
@@ -243,11 +260,13 @@ int main(int argc, char **argv)
 
         if (!in_zone) {
             if (d <= MAX_MM) {
+                set_hand_state(1);
                 if (!zone_since) zone_since = t;
                 if (t - zone_since >= ZONE_MS) {
                     in_zone = 1;
                     anchor_valid = 1;
                     hand_lost_since = 0;
+                    set_hand_state(2);
                     anchor_cm = distance_mm_to_cm(d);
                     anchor_step = cur_step;
                     cand_step = cur_step;
@@ -257,10 +276,15 @@ int main(int argc, char **argv)
                 zone_since = 0;
                 anchor_valid = 0;
                 cand_step = -1;
+                set_hand_state(0);
             }
         } else if (d > ZONE_EXIT_MM) {
             if (!hand_lost_since) {
                 hand_lost_since = t;
+                set_hand_state(3);
+                /* Hold the current output during dropout; do not finish a pending ramp. */
+                pending_vol = applied_vol;
+                cur_step = (applied_vol * LEVELS + 50) / 100;
                 fprintf(stderr, "hand_lost: holding control for %d ms\n", HAND_LOST_MS);
             } else if (t - hand_lost_since >= HAND_LOST_MS) {
                 in_zone = 0;
@@ -268,14 +292,20 @@ int main(int argc, char **argv)
                 zone_since = 0;
                 cand_step = -1;
                 hand_lost_since = 0;
+                set_hand_state(0);
+                pending_vol = applied_vol;
+                cur_step = (applied_vol * LEVELS + 50) / 100;
                 fprintf(stderr, "hand_timeout: control ended\n");
             }
         } else if (hand_lost_since) {
             /* Resume without a jump: make the returning hand the new anchor. */
             hand_lost_since = 0;
+            set_hand_state(2);
             anchor_cm = distance_mm_to_cm(d);
-            anchor_step = cur_step;
-            cand_step = cur_step;
+            anchor_step = (applied_vol * LEVELS + 50) / 100;
+            cur_step = anchor_step;
+            pending_vol = applied_vol;
+            cand_step = anchor_step;
             cand_t = t;
             fprintf(stderr, "hand_returned: control resumed\n");
         }
@@ -315,9 +345,15 @@ int main(int argc, char **argv)
         }
 
         if (pending_vol >= 0 && pending_vol != applied_vol && t - last_apply >= VOL_MS) {
-            if (set_volume(pending_vol) == 0) {
-                applied_vol = pending_vol;
-                fprintf(stderr, "volume=%d%%\n", applied_vol);
+            int next_vol = pending_vol;
+            if (next_vol > applied_vol + VOL_SLEW_PCT)
+                next_vol = applied_vol + VOL_SLEW_PCT;
+            else if (next_vol < applied_vol - VOL_SLEW_PCT)
+                next_vol = applied_vol - VOL_SLEW_PCT;
+
+            if (set_volume(next_vol) == 0) {
+                applied_vol = next_vol;
+                fprintf(stderr, "volume=%d%% target=%d%%\n", applied_vol, pending_vol);
             } else {
                 fprintf(stderr, "volgest: amixer failed for %d%%\n", pending_vol);
             }
