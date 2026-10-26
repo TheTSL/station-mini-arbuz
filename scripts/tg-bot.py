@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import threading
 import time
 import traceback
@@ -13,6 +14,8 @@ API = "https://api.telegram.org/bot" + TOKEN
 STATION_API = "http://127.0.0.1:18787/api/v1"
 STATION_TOKEN = open(os.path.join(BASE_DIR, "station_token")).read().strip()
 STATION_HEADERS = {"X-Auth-Token": STATION_TOKEN}
+HTTP = requests.Session()
+VOLUME_QUEUE = queue.Queue()
 
 STATE = os.path.join(PANEL_DIR, "state.json")
 MODE = os.path.join(PANEL_DIR, "desired_mode")
@@ -43,8 +46,8 @@ def write(path, value):
         endpoint = None
     if endpoint:
         try:
-            r = requests.post(STATION_API + "/" + endpoint,
-                              headers=STATION_HEADERS, json=payload, timeout=6)
+            r = HTTP.post(STATION_API + "/" + endpoint,
+                          headers=STATION_HEADERS, json=payload, timeout=(2, 4))
             r.raise_for_status()
             return True
         except requests.RequestException:
@@ -58,17 +61,42 @@ def write(path, value):
 
 def step_volume(delta):
     try:
-        r = requests.post(STATION_API + "/volume/step", headers=STATION_HEADERS,
-                          json={"delta": int(delta)}, timeout=6)
+        r = HTTP.post(STATION_API + "/volume/step", headers=STATION_HEADERS,
+                      json={"delta": int(delta)}, timeout=(2, 4))
         r.raise_for_status()
         return r.json()["volume"]
     except (requests.RequestException, KeyError, ValueError):
         return None
 
 
+def apply_volume_step(chat_id, message_id, delta, markup):
+    v = step_volume(delta)
+    if v is None:
+        send(chat_id, "⚠️ Не удалось изменить громкость. Проверь режим и связь с колонкой.")
+        return
+    if markup:
+        for row in markup.get("inline_keyboard", []):
+            for button in row:
+                if button.get("callback_data") == "status":
+                    button["text"] = f"🔊 {v}%"
+        tg("editMessageReplyMarkup", chat_id=chat_id,
+           message_id=message_id, reply_markup=json.dumps(markup))
+
+
+def volume_loop():
+    while True:
+        chat_id, message_id, delta, markup = VOLUME_QUEUE.get()
+        try:
+            apply_volume_step(chat_id, message_id, delta, markup)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            VOLUME_QUEUE.task_done()
+
+
 def state():
     try:
-        r = requests.get(STATION_API + "/status", headers=STATION_HEADERS, timeout=5)
+        r = HTTP.get(STATION_API + "/status", headers=STATION_HEADERS, timeout=(2, 4))
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -130,7 +158,7 @@ def keyboard(d=None):
 
 def tg(method, **kwargs):
     try:
-        return requests.post(API + "/" + method, data=kwargs, timeout=25).json()
+        return HTTP.post(API + "/" + method, data=kwargs, timeout=(3, 8)).json()
     except Exception:
         return {}
 
@@ -242,11 +270,12 @@ def handle(chat_id, text):
 
 def main():
     threading.Thread(target=live_loop, daemon=True).start()
+    threading.Thread(target=volume_loop, daemon=True).start()
     offset = 0
     while True:
         try:
-            r = requests.get(API + "/getUpdates",
-                             params={"offset": offset, "timeout": 30}, timeout=45)
+            r = HTTP.get(API + "/getUpdates",
+                         params={"offset": offset, "timeout": 25}, timeout=(5, 35))
             data = r.json()
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
@@ -276,12 +305,12 @@ def main():
                         answer_cb(cq["id"], "Режим: " + m if ok else "Колонка недоступна")
                         edit(chat_id, msg_id, fmt_status(), keyboard())
                     elif cb.startswith("vol:"):
-                        if state().get("mode") == "normal":
-                            answer_cb(cq["id"], "В режиме Алисы громкость — голосом или жестом")
-                            continue
                         delta = int(cb.split(":", 1)[1])
-                        v = step_volume(delta)
-                        answer_cb(cq["id"], f"{v}%" if v is not None else "Колонка недоступна")
+                        markup = cq["message"].get("reply_markup")
+                        if markup:
+                            markup = json.loads(json.dumps(markup))
+                        VOLUME_QUEUE.put((chat_id, msg_id, delta, markup))
+                        answer_cb(cq["id"], "Команда отправляется на колонку…")
                     elif cb.startswith("mute:"):
                         m = cb.split(":", 1)[1]
                         ok = write(MUTE, m)
