@@ -10,6 +10,9 @@ BASE_DIR = "/opt/tg-bot"
 PANEL_DIR = "/opt/station-panel"
 TOKEN = open(os.path.join(BASE_DIR, "token")).read().strip()
 API = "https://api.telegram.org/bot" + TOKEN
+STATION_API = "http://127.0.0.1:18787/api/v1"
+STATION_TOKEN = open(os.path.join(BASE_DIR, "station_token")).read().strip()
+STATION_HEADERS = {"X-Auth-Token": STATION_TOKEN}
 
 STATE = os.path.join(PANEL_DIR, "state.json")
 MODE = os.path.join(PANEL_DIR, "desired_mode")
@@ -30,17 +33,49 @@ def read(path, default=""):
 
 
 def write(path, value):
+    if path == MODE:
+        endpoint, payload = "mode", {"mode": str(value)}
+    elif path == VOL:
+        endpoint, payload = "volume", {"value": int(value)}
+    elif path == MUTE:
+        endpoint, payload = "mute", {"value": str(value)}
+    else:
+        endpoint = None
+    if endpoint:
+        try:
+            r = requests.post(STATION_API + "/" + endpoint,
+                              headers=STATION_HEADERS, json=payload, timeout=6)
+            r.raise_for_status()
+            return True
+        except requests.RequestException:
+            return False
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(str(value))
     os.replace(tmp, path)
+    return True
+
+
+def step_volume(delta):
+    try:
+        r = requests.post(STATION_API + "/volume/step", headers=STATION_HEADERS,
+                          json={"delta": int(delta)}, timeout=6)
+        r.raise_for_status()
+        return r.json()["volume"]
+    except (requests.RequestException, KeyError, ValueError):
+        return None
 
 
 def state():
     try:
-        return json.load(open(STATE))
+        r = requests.get(STATION_API + "/status", headers=STATION_HEADERS, timeout=5)
+        r.raise_for_status()
+        return r.json()
     except Exception:
-        return {}
+        try:
+            return json.load(open(STATE))
+        except Exception:
+            return {}
 
 
 def fmt_status(d=None):
@@ -170,13 +205,13 @@ def handle(chat_id, text):
         return
 
     if low in ("/alice", "алиса"):
-        write(MODE, "alice")
-        send(chat_id, "Запрошен режим Алисы. Колонка перезагрузится.")
+        ok = write(MODE, "alice")
+        send(chat_id, "Запрошен режим Алисы. Колонка перезагрузится." if ok else "⚠️ Колонка недоступна.")
         return
 
     if low in ("/custom", "свой"):
-        write(MODE, "custom")
-        send(chat_id, "Запрошен свой режим. Колонка перезагрузится.")
+        ok = write(MODE, "custom")
+        send(chat_id, "Запрошен свой режим. Колонка перезагрузится." if ok else "⚠️ Колонка недоступна.")
         return
 
     if low.startswith("/vol"):
@@ -186,20 +221,20 @@ def handle(chat_id, text):
         parts = low.split()
         if len(parts) == 2 and parts[1].lstrip("+-").isdigit():
             v = max(0, min(100, int(parts[1])))
-            write(VOL, v)
-            send(chat_id, f"Громкость → {v}%.")
+            ok = write(VOL, v)
+            send(chat_id, f"Громкость → {v}%." if ok else "⚠️ Колонка недоступна.")
         else:
             send(chat_id, "Использование: /vol 40")
         return
 
     if low == "/mute":
-        write(MUTE, "on")
-        send(chat_id, "Mute включён.")
+        ok = write(MUTE, "on")
+        send(chat_id, "Mute включён." if ok else "⚠️ Колонка недоступна.")
         return
 
     if low == "/unmute":
-        write(MUTE, "off")
-        send(chat_id, "Mute выключен.")
+        ok = write(MUTE, "off")
+        send(chat_id, "Mute выключен." if ok else "⚠️ Колонка недоступна.")
         return
 
     send(chat_id, "Команды: /status (живой режим), /alice, /custom, /vol 40, /mute, /unmute, /stop")
@@ -237,25 +272,20 @@ def main():
                         edit(chat_id, msg_id, "⏹ Обновление остановлено.\n\n" + fmt_status(), keyboard())
                     elif cb.startswith("mode:"):
                         m = cb.split(":", 1)[1]
-                        write(MODE, m)
-                        answer_cb(cq["id"], "Режим: " + m)
+                        ok = write(MODE, m)
+                        answer_cb(cq["id"], "Режим: " + m if ok else "Колонка недоступна")
                         edit(chat_id, msg_id, fmt_status(), keyboard())
                     elif cb.startswith("vol:"):
                         if state().get("mode") == "normal":
                             answer_cb(cq["id"], "В режиме Алисы громкость — голосом или жестом")
                             continue
                         delta = int(cb.split(":", 1)[1])
-                        try:
-                            base = int(state().get("volume", "0%").replace("%", ""))
-                        except Exception:
-                            base = 50
-                        v = max(0, min(100, base + delta))
-                        write(VOL, v)
-                        answer_cb(cq["id"], f"{v}%")
+                        v = step_volume(delta)
+                        answer_cb(cq["id"], f"{v}%" if v is not None else "Колонка недоступна")
                     elif cb.startswith("mute:"):
                         m = cb.split(":", 1)[1]
-                        write(MUTE, m)
-                        answer_cb(cq["id"], m)
+                        ok = write(MUTE, m)
+                        answer_cb(cq["id"], m if ok else "Колонка недоступна")
                     continue
 
                 msg = upd.get("message") or upd.get("edited_message")

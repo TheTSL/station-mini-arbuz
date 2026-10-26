@@ -1,0 +1,33 @@
+#!/bin/sh
+# Keep a loopback-only SSH reverse tunnel from the station to the bot VPS.
+PIDFILE=/var/run/station-bridge.pid
+VPS_FILE=/data/opt/station-vps.addr
+case "$1" in
+  start)
+    [ -s "$VPS_FILE" ] || exit 1
+    VPS_HOST=$(cat "$VPS_FILE")
+    if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then exit 0; fi
+    (
+      sleep 15
+      while true; do
+        /data/opt/dbclient -N -T -q -K 30 \
+          -i /data/opt/station-vps.key \
+          -o BatchMode=yes -o ExitOnForwardFailure=yes \
+          -o StrictHostKeyChecking=yes \
+          -R 127.0.0.1:18787:127.0.0.1:8787 \
+          "stationbridge@$VPS_HOST" >>/tmp/station-bridge.log 2>&1
+        sleep 5
+      done
+    ) >/dev/null 2>&1 </dev/null &
+    echo $! > "$PIDFILE"
+    ;;
+  stop)
+    if [ -s "$PIDFILE" ]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
+    rm -f "$PIDFILE"
+    killall dbclient 2>/dev/null || true
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+esac

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Local API is idle until a client connects; it runs in both station modes.
+case "$1" in
+  start)
+    if ! pidof station-api >/dev/null 2>&1; then
+      setsid /data/opt/station-api >/tmp/station-api.log 2>&1 </dev/null &
+    fi
+    ;;
+  stop)
+    killall station-api 2>/dev/null || true
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+esac

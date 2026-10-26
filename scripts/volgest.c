@@ -50,6 +50,7 @@
 #define LED_SEGMENTS 10
 #define LED_CHANNELS 36
 #define LED_REFRESH_MS 200
+#define REMOTE_LED_MS 1500
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -117,6 +118,15 @@ static int set_volume(int pct)
     char value[16];
     snprintf(value, sizeof(value), "%d%%", pct);
     return amixer_command("Master", value);
+}
+
+static void publish_volume(int pct)
+{
+    FILE *f = fopen("/tmp/volgest.volume.tmp", "w");
+    if (!f) return;
+    fprintf(f, "%d\n", pct);
+    if (fclose(f) == 0) rename("/tmp/volgest.volume.tmp", "/tmp/volgest.volume");
+    else unlink("/tmp/volgest.volume.tmp");
 }
 
 static void write_le16(FILE *fp, unsigned int value)
@@ -305,6 +315,7 @@ int main(int argc, char **argv)
     double ema = -1;
     int last_written = -1;
     int current_pct = calibration_mode ? 0 : read_volume();
+    if (!calibration_mode) publish_volume(current_pct);
     int cur_step = (current_pct * LEVELS + 50) / 100;
     int cand_step = -1, anchor_step = cur_step;
     int prev_step = cur_step, motion_dir = 0, motion_run = 0;
@@ -316,6 +327,7 @@ int main(int argc, char **argv)
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
     long long last_feedback = 0, last_control_report = 0;
     long long last_led_refresh = 0;
+    long long last_remote_check = 0, remote_display_until = 0;
     int hover_min = 0, hover_max = 0;
     double ambient_mm = -1;
     long long last_near = 0, last_report = 0;
@@ -368,6 +380,40 @@ int main(int argc, char **argv)
                 last_report = t;
             }
             continue;
+        }
+
+        if (t - last_remote_check >= 50) {
+            FILE *remote = fopen("/tmp/volgest.remote-volume", "r");
+            last_remote_check = t;
+            if (remote) {
+                long long stamp = 0;
+                int remote_pct = -1;
+                int valid = fscanf(remote, "%lld %d", &stamp, &remote_pct) == 2;
+                fclose(remote);
+                unlink("/tmp/volgest.remote-volume");
+                long long age = (long long)time(NULL) - stamp;
+                if (valid && age >= 0 && age <= 5 &&
+                    remote_pct >= 0 && remote_pct <= 100) {
+                    applied_vol = pending_vol = remote_pct;
+                    publish_volume(remote_pct);
+                    cur_step = (remote_pct * LEVELS + 50) / 100;
+                    cand_step = prev_step = cur_step;
+                    motion_dir = motion_run = 0;
+                    last_apply = t;
+                    if (armed && hand_keep) {
+                        anchor_cm = distance_mm_to_cm(d);
+                        anchor_step = cur_step;
+                        min_latched = cur_step == 0;
+                        max_latched = cur_step == LEVELS;
+                    } else if (armed) {
+                        armed = 0;
+                        hover_since = 0;
+                    }
+                    remote_display_until = t + REMOTE_LED_MS;
+                    led_bucket = -1;
+                    fprintf(stderr, "remote_volume=%d%%: ring shown\n", remote_pct);
+                }
+            }
         }
 
         if (!in_zone) {
@@ -566,7 +612,8 @@ int main(int argc, char **argv)
         }
 
         /* гасим с задержкой, чтобы не мигало */
-        int marker_active = hand_seen || in_zone;
+        int hand_marker = hand_seen || in_zone;
+        int marker_active = hand_marker || t < remote_display_until;
         if (marker_active) last_near = t;
         if (shown && !marker_active && t - last_near > CLEAR_MS) {
             led_bar(0, 0, 0, 0, 0);
@@ -583,6 +630,7 @@ int main(int argc, char **argv)
             int previous_vol = applied_vol;
             if (set_volume(next_vol) == 0) {
                 applied_vol = next_vol;
+                publish_volume(applied_vol);
                 fprintf(stderr, "volume=%d%% target=%d%%\n", applied_vol, pending_vol);
                 if (applied_vol / FEEDBACK_STEP_PCT !=
                         previous_vol / FEEDBACK_STEP_PCT &&
@@ -600,7 +648,7 @@ int main(int argc, char **argv)
         if (marker_active) {
             int bucket = applied_vol / 10;
             if (t - last_led_refresh >= LED_REFRESH_MS || bucket != led_bucket) {
-                led_volume(applied_vol, marker_active);
+                led_volume(applied_vol, hand_marker);
                 led_bucket = bucket;
                 shown = 1;
                 last_led_refresh = t;
