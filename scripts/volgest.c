@@ -41,7 +41,6 @@
 #define FEEDBACK_COOLDOWN_MS 250
 #define LED_SEGMENTS 10
 #define LED_REFRESH_MS 200
-#define LED_MAX_PWM 153
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -228,15 +227,25 @@ static void led_bar(int n, int r, int g, int b)
 
 static void led_volume(int pct)
 {
+    static const int rainbow[11][3] = {
+        {  90,   0, 153 }, /* violet */
+        {  45,   0, 153 }, /* indigo */
+        {   0,   0, 153 }, /* blue */
+        {   0,  77, 153 }, /* azure */
+        {   0, 153, 153 }, /* cyan */
+        {   0, 153,   0 }, /* green */
+        {  77, 153,   0 }, /* yellow-green */
+        { 153, 153,   0 }, /* yellow */
+        { 153,  76,   0 }, /* orange */
+        { 153,  38,   0 }, /* vermilion */
+        { 153,   0,   0 }  /* red */
+    };
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     int decile = pct / 10;
     int n = (pct + 9) / 10;
-    if (n < 1) n = 1;  /* keep a visible blue marker at 0% while a hand is present */
-    int r = LED_MAX_PWM * decile / 10;
-    int g = 96 * (10 - decile) / 10;
-    int b = LED_MAX_PWM * (10 - decile) / 10;
-    led_bar(n, r, g, b);
+    if (n < 1) n = 1;  /* keep a visible violet marker at 0% while a hand is present */
+    led_bar(n, rainbow[decile][0], rainbow[decile][1], rainbow[decile][2]);
 }
 
 int main(int argc, char **argv)
