@@ -23,7 +23,6 @@
 #include <sys/wait.h>
 
 #define MAX_MM       420    /* уверенно обнаруживаемая ближняя зона */
-#define ZONE_EXIT_MM 430    /* ближняя зона с гистерезисом */
 #define MAX_HAND_CM  60.0   /* заявленная дальность ToF для жестов */
 #define FAR_HAND_ENTER_MM 50
 #define FAR_HAND_RELEASE_MM 30
@@ -275,7 +274,7 @@ int main(int argc, char **argv)
     int shown = 0, led_bucket = -1;
     long long cand_t = 0, last_apply = 0;
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
-    long long last_feedback = 0;
+    long long last_feedback = 0, last_control_report = 0;
     long long last_led_refresh = 0;
     int hover_min = 0, hover_max = 0;
     double ambient_mm = -1;
@@ -294,16 +293,17 @@ int main(int argc, char **argv)
         ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
         int d = (int)(ema + 0.5);
 
-        /* Keep the verified near zone, and allow up to 60 cm only when the
-         * return is clearly nearer than the slowly tracked room background. */
+        /* A hand must be closer than the slowly tracked room background at
+         * every distance. The old unconditional near-zone shortcut accepted
+         * brief ToF reflections as a real hand and could arm on empty space. */
         if (ambient_mm < 0) ambient_mm = d;
         int within_hand_limit = distance_mm_to_cm(d) <= MAX_HAND_CM;
         int far_hand_enter = d < ambient_mm - FAR_HAND_ENTER_MM;
         int far_hand_keep = d < ambient_mm - FAR_HAND_RELEASE_MM;
         if (!in_zone && d > MAX_MM && !far_hand_enter)
             ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
-        int hand_enter = within_hand_limit && (d <= MAX_MM || far_hand_enter);
-        int hand_keep = within_hand_limit && (d <= ZONE_EXIT_MM || far_hand_keep);
+        int hand_enter = within_hand_limit && far_hand_enter;
+        int hand_keep = within_hand_limit && far_hand_keep;
 
         if (last_written < 0 || abs(d - last_written) >= 2) {
             FILE *fp = fopen("/tmp/volgest.dist", "w");
@@ -461,6 +461,13 @@ int main(int argc, char **argv)
                 if (!min_latched && !max_latched &&
                     (travel_cm < 0 ? -travel_cm : travel_cm) < MOVE_START_CM)
                     step = anchor_step;
+                if (t - last_control_report >= 150) {
+                    fprintf(stderr,
+                            "control raw=%d filtered=%d ambient=%.0f hand=%.1f anchor=%.1f travel=%.1f step=%d min=%d max=%d\n",
+                            raw, d, ambient_mm, hand_cm, anchor_cm, travel_cm,
+                            step, min_latched, max_latched);
+                    last_control_report = t;
+                }
                 if (abs(step - cur_step) < STEP_DEADBAND)
                     step = cur_step;
 
