@@ -45,6 +45,9 @@
 #define VOL_SLEW_PCT 5
 #define FEEDBACK_STEP_PCT 10
 #define FEEDBACK_COOLDOWN_MS 250
+#define LED_SEGMENTS 10
+#define LED_REFRESH_MS 200
+#define LED_MAX_PWM 153
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -234,19 +237,32 @@ static void led_bar(int n, int r, int g, int b)
 {
     if (i2c_fd < 0) return;
     if (n < 0) n = 0;
-    if (n > 6) n = 6;
+    if (n > LED_SEGMENTS) n = LED_SEGMENTS;
 
-    unsigned char buf[19];
+    unsigned char buf[1 + LED_SEGMENTS * 3];
     buf[0] = 0x01;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < LED_SEGMENTS; i++) {
         int on = (i < n);
         buf[1 + i*3 + 0] = on ? (unsigned char)b : 0;
         buf[1 + i*3 + 1] = on ? (unsigned char)g : 0;
         buf[1 + i*3 + 2] = on ? (unsigned char)r : 0;
     }
-    if (write(i2c_fd, buf, 19) != 19) return;
+    if (write(i2c_fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) return;
     unsigned char commit[2] = { 0x25, 0xAA };
     if (write(i2c_fd, commit, 2) != 2) return;
+}
+
+static void led_volume(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int decile = pct / 10;
+    int n = (pct + 9) / 10;
+    if (n < 1) n = 1;  /* keep a visible blue marker at 0% while a hand is present */
+    int r = LED_MAX_PWM * decile / 10;
+    int g = 96 * (10 - decile) / 10;
+    int b = LED_MAX_PWM * (10 - decile) / 10;
+    led_bar(n, r, g, b);
 }
 
 int main(int argc, char **argv)
@@ -269,10 +285,11 @@ int main(int argc, char **argv)
     double anchor_cm = 0;
     int in_zone = 0, armed = 0, red = 0, mute_latched = 0;
     int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
-    int bar_n = -1, shown = 0;
+    int bar_n = -1, shown = 0, led_red_mode = -1, led_bucket = -1;
     long long cand_t = 0, near_since = 0, last_mute = 0, last_apply = 0;
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
     long long last_feedback = 0;
+    long long last_led_refresh = 0;
     int hover_min = 0, hover_max = 0;
     double ambient_mm = -1;
     long long last_near = 0, last_report = 0;
@@ -327,7 +344,6 @@ int main(int argc, char **argv)
         }
 
         if (red) {
-            if (bar_n != 6 || !shown) { led_bar(6, 255, 0, 0); bar_n = 6; shown = 1; }
             last_near = t;
             if (!near_since) near_since = t;
             if (!mute_latched && t - near_since > MUTE_HOLD_MS && t - last_mute > 1500) {
@@ -447,12 +463,6 @@ int main(int argc, char **argv)
                 if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
                     cur_step = cand_step;
                     pending_vol = (cur_step * 100 + LEVELS / 2) / LEVELS;
-                    int leds = (cur_step * 6 + LEVELS / 2) / LEVELS;
-                    if (!red && (leds != bar_n || !shown)) {
-                        led_bar(leds, 0, 160, 255);
-                        bar_n = leds;
-                        shown = 1;
-                    }
                 }
             }
             last_near = t;
@@ -486,6 +496,27 @@ int main(int argc, char **argv)
                 fprintf(stderr, "volgest: amixer failed for %d%%\n", pending_vol);
             }
             last_apply = t;
+        }
+
+        /* Reassert the display while the hand is captured so the ring stays lit. */
+        if (red || in_zone) {
+            int bucket = applied_vol / 10;
+            if (led_red_mode != red || t - last_led_refresh >= LED_REFRESH_MS ||
+                (!red && bucket != led_bucket)) {
+                if (red) {
+                    led_bar(LED_SEGMENTS, LED_MAX_PWM, 0, 0);
+                    bar_n = LED_SEGMENTS;
+                } else {
+                    led_volume(applied_vol);
+                    bar_n = (applied_vol + 9) / 10;
+                    if (bar_n < 1) bar_n = 1;
+                    led_bucket = bucket;
+                }
+                shown = 1;
+                led_red_mode = red;
+                last_led_refresh = t;
+                last_near = t;
+            }
         }
     }
     return 0;
