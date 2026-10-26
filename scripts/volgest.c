@@ -44,6 +44,7 @@
 #define FEEDBACK_STEP_PCT 10
 #define FEEDBACK_COOLDOWN_MS 250
 #define LED_SEGMENTS 10
+#define LED_CHANNELS 36
 #define LED_REFRESH_MS 200
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
@@ -57,6 +58,12 @@ static long long now_ms(void)
 
 static int i2c_fd = -1;
 
+static int led_write_reg(int fd, unsigned char reg, unsigned char value)
+{
+    unsigned char msg[2] = { reg, value };
+    return write(fd, msg, sizeof(msg)) == (ssize_t)sizeof(msg) ? 0 : -1;
+}
+
 static int i2c_open_dev(void)
 {
     char path[32];
@@ -64,6 +71,24 @@ static int i2c_open_dev(void)
     int fd = open(path, O_RDWR);
     if (fd < 0) return -1;
     if (ioctl(fd, I2C_SLAVE, I2C_ADDR) < 0) { close(fd); return -1; }
+
+    /* IS31FL3236A: the old `i2c_led off` wrote zero to 0x00, entering
+     * software shutdown. Re-enable the chip and its 30 used outputs at
+     * quarter current. Initialize every PWM channel to zero first. */
+    unsigned char control[1 + LED_CHANNELS];
+    unsigned char pwm[1 + LED_CHANNELS] = { 0 };
+    control[0] = 0x26;
+    pwm[0] = 0x01;
+    for (int i = 0; i < LED_CHANNELS; i++)
+        control[i + 1] = i < LED_SEGMENTS * 3 ? 0x07 : 0x00;
+    if (led_write_reg(fd, 0x00, 0x01) < 0 ||
+        write(fd, control, sizeof(control)) != (ssize_t)sizeof(control) ||
+        write(fd, pwm, sizeof(pwm)) != (ssize_t)sizeof(pwm) ||
+        led_write_reg(fd, 0x4a, 0x00) < 0 ||
+        led_write_reg(fd, 0x25, 0x00) < 0) {
+        close(fd);
+        return -1;
+    }
     return fd;
 }
 
@@ -216,7 +241,7 @@ static void led_bar(int n, int r, int g, int b, int hand_marker)
     if (n < 0) n = 0;
     if (n > LED_SEGMENTS) n = LED_SEGMENTS;
 
-    unsigned char buf[1 + LED_SEGMENTS * 3];
+    unsigned char buf[1 + LED_CHANNELS] = { 0 };
     buf[0] = 0x01;
     for (int i = 0; i < LED_SEGMENTS; i++) {
         int on = (i < n);
@@ -231,7 +256,7 @@ static void led_bar(int n, int r, int g, int b, int hand_marker)
         buf[1 + i*3 + 2] = on ? (unsigned char)pixel_r : 0;
     }
     if (write(i2c_fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) return;
-    unsigned char commit[2] = { 0x25, 0xAA };
+    unsigned char commit[2] = { 0x25, 0x00 };
     if (write(i2c_fd, commit, 2) != 2) return;
 }
 
@@ -268,6 +293,8 @@ int main(int argc, char **argv)
 
     if (!calibration_mode)
         i2c_fd = i2c_open_dev();
+    if (!calibration_mode)
+        fprintf(stderr, "led_driver=%s\n", i2c_fd >= 0 ? "ready" : "unavailable");
     if (!calibration_mode)
         prepare_volume_feedback();
     struct input_event ev;

@@ -1,16 +1,13 @@
 /*
- * i2c_led.c — прямая работа с LED-кольцом (TI SN3236, i2c-0, 0x3c).
+ * i2c_led.c — прямая работа с LED-кольцом (IS31FL3236A, i2c-0, 0x3c).
  *
  * Использование:
  *   i2c_led <bus> <addr> <cmd> [значение]
  *
  * cmd:
- *   is31      — попытка инициализации по карте IS31FL3236:
- *               PWM 0x00..0x23 = value (по умолчанию 0xFF),
- *               0x24 (global current) = 0x7F, 0x25 (global control) = 0x01,
- *               0x27 (update) = 0x00
+ *   is31      — включить драйвер и заполнить PWM 0x01..0x24
  *   pwm <v>   — установить все PWM в v и обновить
- *   off       — все PWM в 0 и обновить
+ *   off       — все PWM в 0 и обновить, не выключая драйвер через 0x00
  *   reg <r> <v> — записать один регистр
  *
  * Сборка:
@@ -25,6 +22,9 @@
 #include <sys/ioctl.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
+
+#define CHANNELS 36
+#define MAX_PWM 153
 
 static int i2c_open(int bus, int addr)
 {
@@ -54,6 +54,26 @@ static int write_reg(int fd, unsigned char reg, unsigned char val)
     return 0;
 }
 
+static unsigned char safe_pwm(int value)
+{
+    if (value < 0) value = 0;
+    if (value > MAX_PWM) value = MAX_PWM;
+    return (unsigned char)value;
+}
+
+static int write_frame(int fd, const unsigned char pwm[CHANNELS])
+{
+    unsigned char control[CHANNELS];
+    memset(control, 0x07, sizeof(control)); /* outputs on, quarter current */
+    if (write_reg(fd, 0x00, 0x01) < 0 ||
+        write_regs(fd, 0x01, pwm, CHANNELS) < 0 ||
+        write_regs(fd, 0x26, control, CHANNELS) < 0 ||
+        write_reg(fd, 0x4a, 0x00) < 0 ||
+        write_reg(fd, 0x25, 0x00) < 0)
+        return -1;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 4) {
@@ -66,59 +86,38 @@ int main(int argc, char **argv)
     int fd = i2c_open(bus, addr);
     if (fd < 0) return 2;
 
-    if (!strcmp(cmd, "is31")) {
-        unsigned char pwm[36];
-        int v = (argc > 4) ? atoi(argv[4]) : 0xFF;
-        memset(pwm, v, sizeof(pwm));
-        write_regs(fd, 0x00, pwm, 36);
-        write_reg(fd, 0x24, 0x7F);
-        write_reg(fd, 0x25, 0x01);
-        write_reg(fd, 0x26, 0x00);
-        write_reg(fd, 0x27, 0x00);
-        printf("is31 init done (pwm=%d)\n", v);
-    } else if (!strcmp(cmd, "pwm")) {
-        unsigned char pwm[36];
-        int v = (argc > 4) ? atoi(argv[4]) : 0xFF;
-        memset(pwm, v, sizeof(pwm));
-        write_regs(fd, 0x00, pwm, 36);
-        write_reg(fd, 0x27, 0x00);
-        printf("pwm=%d\n", v);
+    if (!strcmp(cmd, "is31") || !strcmp(cmd, "pwm")) {
+        unsigned char pwm[CHANNELS];
+        unsigned char value = safe_pwm(argc > 4 ? atoi(argv[4]) : 64);
+        memset(pwm, value, sizeof(pwm));
+        if (write_frame(fd, pwm) != 0) { close(fd); return 3; }
+        printf("pwm=%u\n", value);
     } else if (!strcmp(cmd, "mask")) {
-        /* mask <start> <end> <val> [cur] — пакетная запись: только каналы start..end */
-        if (argc < 7) { fprintf(stderr, "mask <start> <end> <val> [cur]\n"); close(fd); return 1; }
+        /* mask <start> <end> <val> — только каналы start..end */
+        if (argc < 7) { fprintf(stderr, "mask <start> <end> <val>\n"); close(fd); return 1; }
         int s0 = atoi(argv[4]), e0 = atoi(argv[5]), val = atoi(argv[6]);
-        int cur = (argc > 7) ? (int)strtol(argv[7], NULL, 0) : 0x40;
-        unsigned char pwm[36];
+        if (s0 < 0 || s0 > e0 || e0 >= CHANNELS) { close(fd); return 1; }
+        unsigned char pwm[CHANNELS];
         memset(pwm, 0, sizeof(pwm));
-        for (int i = s0; i <= e0 && i < 36; i++) pwm[i] = (unsigned char)val;
-        write_regs(fd, 0x00, pwm, 36);
-        write_reg(fd, 0x24, (unsigned char)cur);
-        write_reg(fd, 0x25, 0x01);
-        write_reg(fd, 0x26, 0x00);
-        write_reg(fd, 0x27, 0x00);
-        printf("mask %d..%d = %d (cur=%d)\n", s0, e0, val, cur);
+        for (int i = s0; i <= e0; i++) pwm[i] = safe_pwm(val);
+        if (write_frame(fd, pwm) != 0) { close(fd); return 3; }
+        printf("mask %d..%d = %u\n", s0, e0, safe_pwm(val));
     } else if (!strcmp(cmd, "color")) {
-        /* color <r> <g> <b> [current] — одинаковый цвет на всех светодиодах */
-        if (argc < 7) { fprintf(stderr, "color <r> <g> <b> [cur]\n"); close(fd); return 1; }
+        /* color <r> <g> <b> — одинаковый цвет на всех светодиодах */
+        if (argc < 7) { fprintf(stderr, "color <r> <g> <b>\n"); close(fd); return 1; }
         int r = atoi(argv[4]), g = atoi(argv[5]), b = atoi(argv[6]);
-        int cur = (argc > 7) ? atoi(argv[7]) : 0x08;
-        unsigned char pwm[36];
-        for (int i = 0; i < 12; i++) {
-            pwm[i*3+0] = (unsigned char)r;
-            pwm[i*3+1] = (unsigned char)g;
-            pwm[i*3+2] = (unsigned char)b;
+        unsigned char pwm[CHANNELS];
+        for (int i = 0; i < CHANNELS / 3; i++) {
+            pwm[i*3+0] = safe_pwm(r);
+            pwm[i*3+1] = safe_pwm(g);
+            pwm[i*3+2] = safe_pwm(b);
         }
-        write_regs(fd, 0x00, pwm, 36);
-        write_reg(fd, 0x24, (unsigned char)cur);
-        write_reg(fd, 0x25, 0x01);
-        write_reg(fd, 0x26, 0x00);
-        write_reg(fd, 0x27, 0x00);
-        printf("color r=%d g=%d b=%d cur=%d\n", r, g, b, cur);
+        if (write_frame(fd, pwm) != 0) { close(fd); return 3; }
+        printf("color r=%u g=%u b=%u\n", safe_pwm(r), safe_pwm(g), safe_pwm(b));
     } else if (!strcmp(cmd, "off")) {
-        unsigned char pwm[36];
+        unsigned char pwm[CHANNELS];
         memset(pwm, 0, sizeof(pwm));
-        write_regs(fd, 0x00, pwm, 36);
-        write_reg(fd, 0x27, 0x00);
+        if (write_frame(fd, pwm) != 0) { close(fd); return 3; }
         printf("off\n");
     } else if (!strcmp(cmd, "reg")) {
         if (argc < 6) { fprintf(stderr, "reg <r> <v>\n"); close(fd); return 1; }
