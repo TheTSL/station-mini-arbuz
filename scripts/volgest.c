@@ -238,8 +238,8 @@ static void led_bar(int n, int r, int g, int b, int hand_marker)
 static void led_volume(int pct, int hand_marker)
 {
     static const int rainbow[11][3] = {
-        {  90,   0, 153 }, /* violet */
-        {  45,   0, 153 }, /* indigo */
+        { 128,   0, 192 }, /* saturated violet at minimum */
+        {  55,   0, 192 }, /* indigo */
         {   0,   0, 153 }, /* blue */
         {   0,  77, 153 }, /* azure */
         {   0, 153, 153 }, /* cyan */
