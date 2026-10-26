@@ -275,11 +275,9 @@ int main(int argc, char **argv)
     int shown = 0, led_bucket = -1;
     long long cand_t = 0, last_apply = 0;
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
-    long long min_release_since = 0;
     long long last_feedback = 0;
     long long last_led_refresh = 0;
     int hover_min = 0, hover_max = 0;
-    double min_release_min_cm = 0, min_release_max_cm = 0;
     double ambient_mm = -1;
     long long last_near = 0, last_report = 0;
 
@@ -399,7 +397,6 @@ int main(int argc, char **argv)
                         anchor_step = cur_step;
                         min_latched = cur_step == 0;
                         max_latched = cur_step == LEVELS;
-                        min_release_since = 0;
                         cand_step = cur_step;
                         cand_t = t;
                         set_hand_state(2);
@@ -413,38 +410,22 @@ int main(int argc, char **argv)
                 int step;
 
                 if (min_latched) {
-                    /* Track further inward motion. To leave the 0% stop, require
-                     * a deliberate 3 cm retreat followed by a stable hover. The
-                     * new position becomes a fresh 0% anchor; only later outward
-                     * movement raises volume. This prevents a noisy near-field
-                     * jump or simply withdrawing the hand from sweeping to 100%. */
+                    /* Track further inward motion. Once the hand has deliberately
+                     * retreated by 3 cm, make that position a fresh 0% anchor. Do
+                     * not map the retreat itself to volume: only subsequent motion
+                     * outward raises the level. */
                     if (hand_cm < anchor_cm) anchor_cm = hand_cm;
                     travel_cm = hand_cm - anchor_cm;
                     if (travel_cm < LIMIT_RELEASE_CM) {
                         step = 0;
-                        min_release_since = 0;
                     } else {
-                        if (!min_release_since) {
-                            min_release_since = t;
-                            min_release_min_cm = min_release_max_cm = hand_cm;
-                        } else {
-                            if (hand_cm < min_release_min_cm) min_release_min_cm = hand_cm;
-                            if (hand_cm > min_release_max_cm) min_release_max_cm = hand_cm;
-                            if ((min_release_max_cm - min_release_min_cm) * 10.0 > HOVER_SPAN_MM) {
-                                min_release_since = t;
-                                min_release_min_cm = min_release_max_cm = hand_cm;
-                            }
-                        }
+                        min_latched = 0;
+                        anchor_cm = hand_cm;
+                        anchor_step = 0;
                         step = 0;
-                        if (t - min_release_since >= HOVER_STABLE_MS) {
-                            min_latched = 0;
-                            anchor_cm = hand_cm;
-                            anchor_step = 0;
-                            min_release_since = 0;
-                            cand_step = 0;
-                            cand_t = t;
-                            fprintf(stderr, "min_rearmed: stable new 0%% anchor; move outward to raise volume\n");
-                        }
+                        cand_step = 0;
+                        cand_t = t;
+                        fprintf(stderr, "min_rearmed: new 0%% anchor; move outward to raise volume\n");
                     }
                 } else if (max_latched) {
                     /* Symmetric hold at 100%; the hand must move inward
@@ -473,7 +454,6 @@ int main(int argc, char **argv)
                         min_latched = 1;
                         anchor_cm = hand_cm;
                         anchor_step = 0;
-                        min_release_since = 0;
                     }
                 }
 
