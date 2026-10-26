@@ -30,6 +30,9 @@
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
 #define STEP_DEADBAND 2
+#define HOVER_STABLE_MS 350
+#define HOVER_SPAN_MM 12
+#define MOVE_START_CM 0.8
 #define MUTE_HOLD_MS 700
 #define SETTLE_MS    50
 #define ZONE_MS      250
@@ -37,6 +40,8 @@
 #define CLEAR_MS     500
 #define VOL_MS       60
 #define VOL_SLEW_PCT 5
+#define FEEDBACK_STEP_PCT 10
+#define FEEDBACK_COOLDOWN_MS 250
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -80,6 +85,54 @@ static int set_volume(int pct)
     char value[16];
     snprintf(value, sizeof(value), "%d%%", pct);
     return amixer_command("Master", value);
+}
+
+static void write_le16(FILE *fp, unsigned int value)
+{
+    fputc((int)(value & 0xff), fp);
+    fputc((int)((value >> 8) & 0xff), fp);
+}
+
+static void write_le32(FILE *fp, unsigned int value)
+{
+    write_le16(fp, value & 0xffff);
+    write_le16(fp, value >> 16);
+}
+
+static void prepare_volume_feedback(void)
+{
+    const unsigned int rate = 48000, frames = 1536;
+    FILE *fp = fopen("/tmp/volgest-step.wav", "wb");
+    if (!fp) return;
+
+    fwrite("RIFF", 1, 4, fp); write_le32(fp, 36 + frames * 4);
+    fwrite("WAVEfmt ", 1, 8, fp); write_le32(fp, 16);
+    write_le16(fp, 1); write_le16(fp, 2); write_le32(fp, rate);
+    write_le32(fp, rate * 4); write_le16(fp, 4); write_le16(fp, 16);
+    fwrite("data", 1, 4, fp); write_le32(fp, frames * 4);
+
+    for (unsigned int i = 0; i < frames; i++) {
+        double envelope = 1.0;
+        if (i < 96) envelope = (double)i / 96.0;
+        else if (i >= frames - 96) envelope = (double)(frames - i) / 96.0;
+        unsigned int phase = i % 48;
+        int wave;
+        if (phase < 12) wave = (int)phase * 117;
+        else if (phase < 24) wave = 1400 - (int)(phase - 12) * 117;
+        else if (phase < 36) wave = -(int)(phase - 24) * 117;
+        else wave = -1400 + (int)(phase - 36) * 117;
+        int sample = (int)(envelope * wave);
+        write_le16(fp, (unsigned int)(unsigned short)(short)sample);
+        write_le16(fp, (unsigned int)(unsigned short)(short)sample);
+    }
+    fclose(fp);
+}
+
+static void play_volume_feedback(void)
+{
+    int status = system("/tmp/pcm_play hw:0,0 /tmp/volgest-step.wav "
+                        ">/dev/null 2>&1 &");
+    (void)status;
 }
 
 static void set_hand_state(int state)
@@ -192,18 +245,22 @@ int main(int argc, char **argv)
 
     if (!calibration_mode)
         i2c_fd = i2c_open_dev();
+    if (!calibration_mode)
+        prepare_volume_feedback();
     struct input_event ev;
     double ema = -1;
     int last_written = -1;
     int current_pct = calibration_mode ? 0 : read_volume();
     int cur_step = (current_pct * LEVELS + 50) / 100;
-    int cand_step = -1, anchor_step = cur_step, anchor_valid = 0;
+    int cand_step = -1, anchor_step = cur_step;
     double anchor_cm = 0;
-    int in_zone = 0, red = 0, mute_latched = 0;
+    int in_zone = 0, armed = 0, red = 0, mute_latched = 0;
     int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
     int bar_n = -1, shown = 0;
     long long cand_t = 0, near_since = 0, last_mute = 0, last_apply = 0;
-    long long zone_since = 0, hand_lost_since = 0;
+    long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
+    long long last_feedback = 0;
+    int hover_min = 0, hover_max = 0;
     long long last_near = 0, last_report = 0;
 
     while (1) {
@@ -264,17 +321,17 @@ int main(int argc, char **argv)
                 if (!zone_since) zone_since = t;
                 if (t - zone_since >= ZONE_MS) {
                     in_zone = 1;
-                    anchor_valid = 1;
+                    armed = 0;
                     hand_lost_since = 0;
-                    set_hand_state(2);
-                    anchor_cm = distance_mm_to_cm(d);
-                    anchor_step = cur_step;
+                    hover_since = 0;
+                    hover_min = hover_max = d;
                     cand_step = cur_step;
                     cand_t = t;
+                    fprintf(stderr, "hand_confirmed: waiting for steady hover\n");
                 }
             } else {
                 zone_since = 0;
-                anchor_valid = 0;
+                hover_since = 0;
                 cand_step = -1;
                 set_hand_state(0);
             }
@@ -282,14 +339,17 @@ int main(int argc, char **argv)
             if (!hand_lost_since) {
                 hand_lost_since = t;
                 set_hand_state(3);
-                /* Hold the current output during dropout; do not finish a pending ramp. */
+                /* Freeze the level during a brief sensor dropout. */
                 pending_vol = applied_vol;
                 cur_step = (applied_vol * LEVELS + 50) / 100;
+                armed = 0;
+                hover_since = 0;
                 fprintf(stderr, "hand_lost: holding control for %d ms\n", HAND_LOST_MS);
             } else if (t - hand_lost_since >= HAND_LOST_MS) {
                 in_zone = 0;
-                anchor_valid = 0;
+                armed = 0;
                 zone_since = 0;
+                hover_since = 0;
                 cand_step = -1;
                 hand_lost_since = 0;
                 set_hand_state(0);
@@ -298,40 +358,66 @@ int main(int argc, char **argv)
                 fprintf(stderr, "hand_timeout: control ended\n");
             }
         } else if (hand_lost_since) {
-            /* Resume without a jump: make the returning hand the new anchor. */
+            /* Require a fresh steady hover after reacquisition. */
             hand_lost_since = 0;
-            set_hand_state(2);
-            anchor_cm = distance_mm_to_cm(d);
-            anchor_step = (applied_vol * LEVELS + 50) / 100;
-            cur_step = anchor_step;
+            set_hand_state(1);
+            hover_since = 0;
+            hover_min = hover_max = d;
+            cur_step = (applied_vol * LEVELS + 50) / 100;
             pending_vol = applied_vol;
-            cand_step = anchor_step;
+            cand_step = cur_step;
             cand_t = t;
-            fprintf(stderr, "hand_returned: control resumed\n");
+            fprintf(stderr, "hand_returned: waiting for steady hover\n");
         }
 
-        if (in_zone && anchor_valid && !hand_lost_since && d <= ZONE_EXIT_MM) {
-            double travel_cm = distance_mm_to_cm(d) - anchor_cm;
-            double target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
-            int step = target_step >= 0 ? (int)(target_step + 0.5) :
-                                          (int)(target_step - 0.5);
-            if (step < 0) step = 0;
-            if (step > LEVELS) step = LEVELS;
+        if (in_zone && !hand_lost_since && d <= ZONE_EXIT_MM) {
+            if (!armed) {
+                set_hand_state(1);
+                if (!hover_since) {
+                    hover_since = t;
+                    hover_min = hover_max = d;
+                } else {
+                    if (d < hover_min) hover_min = d;
+                    if (d > hover_max) hover_max = d;
+                    if (hover_max - hover_min > HOVER_SPAN_MM) {
+                        /* Moving or noisy: restart the pause-before-motion detector. */
+                        hover_since = t;
+                        hover_min = hover_max = d;
+                    } else if (t - hover_since >= HOVER_STABLE_MS) {
+                        armed = 1;
+                        anchor_cm = distance_mm_to_cm(d);
+                        anchor_step = cur_step;
+                        cand_step = cur_step;
+                        cand_t = t;
+                        set_hand_state(2);
+                        fprintf(stderr, "hand_armed: move hand to adjust volume\n");
+                    }
+                }
+            } else {
+                double travel_cm = distance_mm_to_cm(d) - anchor_cm;
+                double target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
+                int step = target_step >= 0 ? (int)(target_step + 0.5) :
+                                              (int)(target_step - 0.5);
+                if (step < 0) step = 0;
+                if (step > LEVELS) step = LEVELS;
 
-            /* Ignore sub-centimeter sensor jitter around the current level. */
-            if (abs(step - cur_step) < STEP_DEADBAND)
-                step = cur_step;
+                /* No volume changes until movement is clearly outside the hover band. */
+                if ((travel_cm < 0 ? -travel_cm : travel_cm) < MOVE_START_CM)
+                    step = anchor_step;
+                if (abs(step - cur_step) < STEP_DEADBAND)
+                    step = cur_step;
 
-            if (step != cand_step) { cand_step = step; cand_t = t; }
+                if (step != cand_step) { cand_step = step; cand_t = t; }
 
-            if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
-                cur_step = cand_step;
-                pending_vol = (cur_step * 100 + LEVELS / 2) / LEVELS;
-                int leds = (cur_step * 6 + LEVELS / 2) / LEVELS;
-                if (!red && (leds != bar_n || !shown)) {
-                    led_bar(leds, 0, 160, 255);
-                    bar_n = leds;
-                    shown = 1;
+                if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
+                    cur_step = cand_step;
+                    pending_vol = (cur_step * 100 + LEVELS / 2) / LEVELS;
+                    int leds = (cur_step * 6 + LEVELS / 2) / LEVELS;
+                    if (!red && (leds != bar_n || !shown)) {
+                        led_bar(leds, 0, 160, 255);
+                        bar_n = leds;
+                        shown = 1;
+                    }
                 }
             }
             last_near = t;
@@ -351,9 +437,16 @@ int main(int argc, char **argv)
             else if (next_vol < applied_vol - VOL_SLEW_PCT)
                 next_vol = applied_vol - VOL_SLEW_PCT;
 
+            int previous_vol = applied_vol;
             if (set_volume(next_vol) == 0) {
                 applied_vol = next_vol;
                 fprintf(stderr, "volume=%d%% target=%d%%\n", applied_vol, pending_vol);
+                if (applied_vol / FEEDBACK_STEP_PCT !=
+                        previous_vol / FEEDBACK_STEP_PCT &&
+                    (!last_feedback || t - last_feedback >= FEEDBACK_COOLDOWN_MS)) {
+                    play_volume_feedback();
+                    last_feedback = t;
+                }
             } else {
                 fprintf(stderr, "volgest: amixer failed for %d%%\n", pending_vol);
             }
