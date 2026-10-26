@@ -2,12 +2,11 @@
  * volgest.c — громкость жестом над VL53L0.
  *
  * Относительное управление (по калибровочным замерам датчика):
- *   - красный/mute: датчик сообщает не более 96 мм (нижний предел около 88 мм)
- *   - зона громкости: примерно 10..42 см
+ *   - зона обнаружения руки: до 42 см по индивидуальной калибровке устройства
  *   - изменение на 15 см перемещения руки соответствует полному ходу громкости
  *   - гашение с задержкой 0.5 с, чтобы не мигало
  *
- * Громкость и mute задаются штатным amixer CLI. Кольцо пробуется через I2C,
+ * Громкость задаётся штатным amixer CLI. Кольцо пробуется через I2C,
  * но на этой плате устойчивое управление кольцом пока не подтверждено.
  */
 
@@ -23,21 +22,14 @@
 #include <linux/i2c-dev.h>
 #include <sys/wait.h>
 
-#define RED_MM       96     /* ближе — красный / начало mute */
-#define RED_EXIT_MM  105    /* гистерезис выхода */
 #define MAX_MM       420    /* уверенно обнаруживаемая ближняя зона */
 #define ZONE_EXIT_MM 430    /* ближняя зона с гистерезисом */
-#define MAX_HAND_CM  70.0   /* жёсткий предел захвата по калибровочной шкале */
-#define HAND_DELTA_MM 45    /* дальняя рука: отличие от адаптивного фона */
-#define HAND_RELEASE_DELTA_MM 30
-#define AMBIENT_ALPHA 0.01  /* адаптация фона только вне активного захвата */
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
 #define STEP_DEADBAND 2
 #define HOVER_STABLE_MS 350
 #define HOVER_SPAN_MM 12
 #define MOVE_START_CM 0.8
-#define MUTE_HOLD_MS 700
 #define SETTLE_MS    50
 #define ZONE_MS      250
 #define HAND_LOST_MS 1000
@@ -214,26 +206,6 @@ static double distance_mm_to_cm(int mm)
     return physical_cm[5];
 }
 
-static void toggle_mute(void)
-{
-    const char *query =
-        "LD_LIBRARY_PATH=/system/vendor/quasar/libs "
-        "/system/workdir/bin/amixer -c 0 sget 'SPK mute' 2>/dev/null";
-    FILE *fp = popen(query, "r");
-    if (!fp) return;
-    char line[256], value[16] = "";
-    int is_muted = -1;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "[on]")) is_muted = 1;
-        else if (strstr(line, "[off]")) is_muted = 0;
-    }
-    int status = pclose(fp);
-    if (is_muted < 0 || status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
-        return;
-    snprintf(value, sizeof(value), "%s", is_muted ? "off" : "on");
-    (void)amixer_command("SPK mute", value);
-}
-
 static void led_bar(int n, int r, int g, int b)
 {
     if (i2c_fd < 0) return;
@@ -284,15 +256,14 @@ int main(int argc, char **argv)
     int cur_step = (current_pct * LEVELS + 50) / 100;
     int cand_step = -1, anchor_step = cur_step;
     double anchor_cm = 0;
-    int in_zone = 0, armed = 0, red = 0, mute_latched = 0;
+    int in_zone = 0, armed = 0;
     int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
-    int bar_n = -1, shown = 0, led_red_mode = -1, led_bucket = -1;
-    long long cand_t = 0, near_since = 0, last_mute = 0, last_apply = 0;
+    int shown = 0, led_bucket = -1;
+    long long cand_t = 0, last_apply = 0;
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
     long long last_feedback = 0;
     long long last_led_refresh = 0;
     int hover_min = 0, hover_max = 0;
-    double ambient_mm = -1;
     long long last_near = 0, last_report = 0;
 
     while (1) {
@@ -308,17 +279,9 @@ int main(int argc, char **argv)
         ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
         int d = (int)(ema + 0.5);
 
-        /* The far end is identified relative to the room return. A fixed 42 cm
-         * cutoff loses a hand before 50 cm; a fixed 50 cm cutoff confuses it
-         * with the no-hand return. Track the latter only while unarmed. */
-        if (ambient_mm < 0) ambient_mm = d;
-        int within_hand_limit = distance_mm_to_cm(d) <= MAX_HAND_CM;
-        int far_hand_enter = d < ambient_mm - HAND_DELTA_MM;
-        int far_hand_keep = d < ambient_mm - HAND_RELEASE_DELTA_MM;
-        if (!in_zone && d > MAX_MM && !far_hand_enter)
-            ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
-        int hand_enter = within_hand_limit && (d <= MAX_MM || far_hand_enter);
-        int hand_keep = within_hand_limit && (d <= ZONE_EXIT_MM || far_hand_keep);
+        /* Ignore the ceiling/room return beyond the calibrated 42 cm zone. */
+        int hand_enter = d <= MAX_MM;
+        int hand_keep = d <= ZONE_EXIT_MM;
 
         if (last_written < 0 || abs(d - last_written) >= 2) {
             FILE *fp = fopen("/tmp/volgest.dist", "w");
@@ -336,26 +299,6 @@ int main(int argc, char **argv)
                 last_report = t;
             }
             continue;
-        }
-
-        /* красный: рука у колонки, с гистерезисом */
-        if (!red) {
-            if (d <= RED_MM) red = 1;
-        } else if (d > RED_EXIT_MM) {
-            red = 0;
-        }
-
-        if (red) {
-            last_near = t;
-            if (!near_since) near_since = t;
-            if (!mute_latched && t - near_since > MUTE_HOLD_MS && t - last_mute > 1500) {
-                toggle_mute();
-                last_mute = t;
-                mute_latched = 1;
-            }
-        } else {
-            near_since = 0;
-            mute_latched = 0;
         }
 
         if (!in_zone) {
@@ -448,7 +391,7 @@ int main(int argc, char **argv)
                     anchor_cm = distance_mm_to_cm(d);
                     anchor_step = LEVELS;
                 } else if (step <= 0 && target_step < 0) {
-                    /* Symmetric behavior at mute: allow continued inward motion. */
+                    /* At minimum volume, keep following continued inward motion. */
                     step = 0;
                     anchor_cm = distance_mm_to_cm(d);
                     anchor_step = 0;
@@ -471,9 +414,8 @@ int main(int argc, char **argv)
         }
 
         /* гасим с задержкой, чтобы не мигало */
-        if (shown && !red && !in_zone && t - last_near > CLEAR_MS) {
+        if (shown && !in_zone && t - last_near > CLEAR_MS) {
             led_bar(0, 0, 0, 0);
-            bar_n = 0;
             shown = 0;
         }
 
@@ -501,21 +443,12 @@ int main(int argc, char **argv)
         }
 
         /* Reassert the display while the hand is captured so the ring stays lit. */
-        if (red || in_zone) {
+        if (in_zone) {
             int bucket = applied_vol / 10;
-            if (led_red_mode != red || t - last_led_refresh >= LED_REFRESH_MS ||
-                (!red && bucket != led_bucket)) {
-                if (red) {
-                    led_bar(LED_SEGMENTS, LED_MAX_PWM, 0, 0);
-                    bar_n = LED_SEGMENTS;
-                } else {
-                    led_volume(applied_vol);
-                    bar_n = (applied_vol + 9) / 10;
-                    if (bar_n < 1) bar_n = 1;
-                    led_bucket = bucket;
-                }
+            if (t - last_led_refresh >= LED_REFRESH_MS || bucket != led_bucket) {
+                led_volume(applied_vol);
+                led_bucket = bucket;
                 shown = 1;
-                led_red_mode = red;
                 last_led_refresh = t;
                 last_near = t;
             }
