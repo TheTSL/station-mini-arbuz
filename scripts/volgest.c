@@ -536,7 +536,10 @@ int main(int argc, char **argv)
                             step, min_latched, max_latched);
                     last_control_report = t;
                 }
-                if (abs(step - cur_step) < STEP_DEADBAND)
+                /* Keep the noise deadband between levels, but never let it
+                 * swallow the final step into 0% or 100%. */
+                if (step != 0 && step != LEVELS &&
+                    abs(step - cur_step) < STEP_DEADBAND)
                     step = cur_step;
 
                 int direction = (step > prev_step) - (step < prev_step);
