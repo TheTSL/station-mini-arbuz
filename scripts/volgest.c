@@ -290,17 +290,23 @@ int main(int argc, char **argv)
         if (raw <= 0) continue;
         long long t = now_ms();
 
-        /* Stronger smoothing keeps sensor quantization from looking like motion. */
-        ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
+        if (ambient_mm < 0) ambient_mm = raw;
+        int raw_background = raw >= ambient_mm - FAR_HAND_RELEASE_MM;
+
+        /* Do not blend a background return into a live hand track: near the
+         * sensor, the hand can briefly disappear and the raw range jumps to
+         * the room. Blending that jump made the ghost distance look like a
+         * fast outward hand movement and drove volume to 100%. */
+        if (!(in_zone && raw_background))
+            ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
         int d = (int)(ema + 0.5);
 
         /* A hand must be closer than the slowly tracked room background at
          * every distance. The old unconditional near-zone shortcut accepted
          * brief ToF reflections as a real hand and could arm on empty space. */
-        if (ambient_mm < 0) ambient_mm = d;
         int within_hand_limit = distance_mm_to_cm(d) <= MAX_HAND_CM;
         int far_hand_enter = d < ambient_mm - FAR_HAND_ENTER_MM;
-        int far_hand_keep = d < ambient_mm - FAR_HAND_RELEASE_MM;
+        int far_hand_keep = raw < ambient_mm - FAR_HAND_RELEASE_MM;
         if (!in_zone && d > MAX_MM && !far_hand_enter)
             ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
         int hand_enter = within_hand_limit && far_hand_enter;
