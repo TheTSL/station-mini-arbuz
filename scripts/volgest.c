@@ -26,6 +26,7 @@
 #define MAX_HAND_CM  60.0   /* заявленная дальность ToF для жестов */
 #define FAR_HAND_ENTER_MM 80
 #define FAR_HAND_RELEASE_MM 50
+#define FAST_ARM_CONTRAST_MM 150
 #define AMBIENT_ALPHA 0.01
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
@@ -36,8 +37,11 @@
 #define HOVER_SPAN_MM 12
 #define MOVE_START_CM 0.8
 #define SETTLE_MS    25
+#define FAST_UPDATE_MS 40
+#define FAST_STEP_MIN 3
 #define ZONE_MS      150
 #define HAND_LOST_MS 1000
+#define HAND_BRIDGE_MS 180
 #define CLEAR_MS     500
 #define VOL_MS       40
 #define VOL_SLEW_PCT 8
@@ -303,11 +307,12 @@ int main(int argc, char **argv)
     int current_pct = calibration_mode ? 0 : read_volume();
     int cur_step = (current_pct * LEVELS + 50) / 100;
     int cand_step = -1, anchor_step = cur_step;
+    int prev_step = cur_step, motion_dir = 0, motion_run = 0;
     double anchor_cm = 0;
     int in_zone = 0, armed = 0, min_latched = 0, max_latched = 0;
     int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
     int shown = 0, led_bucket = -1;
-    long long cand_t = 0, last_apply = 0;
+    long long cand_t = 0, last_apply = 0, last_fast_apply = 0;
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
     long long last_feedback = 0, last_control_report = 0;
     long long last_led_refresh = 0;
@@ -392,8 +397,8 @@ int main(int argc, char **argv)
                 /* Freeze the level during a brief sensor dropout. */
                 pending_vol = applied_vol;
                 cur_step = (applied_vol * LEVELS + 50) / 100;
-                armed = 0;
                 hover_since = 0;
+                motion_dir = motion_run = 0;
                 fprintf(stderr, "hand_lost: holding control for %d ms\n", HAND_LOST_MS);
             } else if (t - hand_lost_since >= HAND_LOST_MS) {
                 in_zone = 0;
@@ -408,21 +413,28 @@ int main(int argc, char **argv)
                 fprintf(stderr, "hand_timeout: control ended\n");
             }
         } else if (hand_lost_since) {
-            /* Require a fresh steady hover after reacquisition. */
+            long long gap_ms = t - hand_lost_since;
             hand_lost_since = 0;
-            set_hand_state(1);
-            hover_since = 0;
-            hover_min = hover_max = d;
-            cur_step = (applied_vol * LEVELS + 50) / 100;
-            pending_vol = applied_vol;
             cand_step = cur_step;
             cand_t = t;
-            fprintf(stderr, "hand_returned: waiting for steady hover\n");
+            prev_step = cur_step;
+            motion_dir = motion_run = 0;
+            if (armed && gap_ms <= HAND_BRIDGE_MS) {
+                set_hand_state(2);
+                fprintf(stderr, "hand_returned: resumed after %lld ms\n", gap_ms);
+            } else {
+                armed = 0;
+                set_hand_state(1);
+                hover_since = 0;
+                hover_min = hover_max = d;
+                fprintf(stderr, "hand_returned: new anchor after %lld ms\n", gap_ms);
+            }
         }
 
         if (in_zone && !hand_lost_since && hand_keep) {
             if (!armed) {
                 set_hand_state(1);
+                int steady_arm = 0;
                 if (!hover_since) {
                     hover_since = t;
                     hover_min = hover_max = d;
@@ -433,17 +445,25 @@ int main(int argc, char **argv)
                         /* Moving or noisy: restart the pause-before-motion detector. */
                         hover_since = t;
                         hover_min = hover_max = d;
-                    } else if (t - hover_since >= HOVER_STABLE_MS) {
-                        armed = 1;
-                        anchor_cm = distance_mm_to_cm(d);
-                        anchor_step = cur_step;
-                        min_latched = cur_step == 0;
-                        max_latched = cur_step == LEVELS;
-                        cand_step = cur_step;
-                        cand_t = t;
-                        set_hand_state(2);
-                        fprintf(stderr, "hand_armed: move hand to adjust volume\n");
-                    }
+                    } else if (t - hover_since >= HOVER_STABLE_MS)
+                        steady_arm = 1;
+                }
+                /* A strong return is enough to arm while the hand is already
+                 * moving. Weak returns still require a steady hover. */
+                int strong_arm = raw < ambient_mm - FAST_ARM_CONTRAST_MM;
+                if (strong_arm || steady_arm) {
+                    armed = 1;
+                    anchor_cm = distance_mm_to_cm(d);
+                    anchor_step = cur_step;
+                    min_latched = cur_step == 0;
+                    max_latched = cur_step == LEVELS;
+                    cand_step = prev_step = cur_step;
+                    cand_t = t;
+                    motion_dir = motion_run = 0;
+                    last_fast_apply = t;
+                    set_hand_state(2);
+                    fprintf(stderr, "hand_armed: %s return; move hand to adjust volume\n",
+                            strong_arm ? "strong" : "steady");
                 }
             } else {
                 double hand_cm = distance_mm_to_cm(d);
@@ -513,11 +533,24 @@ int main(int argc, char **argv)
                 if (abs(step - cur_step) < STEP_DEADBAND)
                     step = cur_step;
 
+                int direction = (step > prev_step) - (step < prev_step);
+                if (direction) {
+                    motion_run = direction == motion_dir ? motion_run + 1 : 1;
+                    motion_dir = direction;
+                } else if (step == cur_step) {
+                    motion_dir = motion_run = 0;
+                }
+                prev_step = step;
                 if (step != cand_step) { cand_step = step; cand_t = t; }
 
-                if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
-                    cur_step = cand_step;
+                int stable_step = cand_step != cur_step && t - cand_t >= SETTLE_MS;
+                int fast_step = motion_run >= 2 &&
+                                abs(step - cur_step) >= FAST_STEP_MIN &&
+                                t - last_fast_apply >= FAST_UPDATE_MS;
+                if (stable_step || fast_step) {
+                    cur_step = fast_step ? step : cand_step;
                     pending_vol = (cur_step * 100 + LEVELS / 2) / LEVELS;
+                    last_fast_apply = t;
                 }
             }
             last_near = t;
