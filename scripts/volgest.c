@@ -1,9 +1,10 @@
 /*
  * volgest.c — громкость жестом над VL53L0.
  *
- * Абсолютные пороги (по реальным замерам датчика):
+ * Относительное управление (по калибровочным замерам датчика):
  *   - красный/mute: датчик сообщает не более 96 мм (нижний предел около 88 мм)
- *   - зона громкости: примерно 15..30 см, 40 уровней с калибровочной кривой
+ *   - зона громкости: примерно 10..42 см
+ *   - изменение на 15 см перемещения руки соответствует полному ходу громкости
  *   - гашение с задержкой 0.5 с, чтобы не мигало
  *
  * Громкость и mute задаются штатным amixer CLI. Кольцо пробуется через I2C,
@@ -24,14 +25,17 @@
 
 #define RED_MM       96     /* ближе — красный / начало mute */
 #define RED_EXIT_MM  105    /* гистерезис выхода */
-#define MAX_MM       350    /* дальняя граница рабочей зоны */
-#define ZONE_EXIT_MM 390    /* выход из зоны */
+#define MAX_MM       420    /* вход в рабочую зону */
+#define ZONE_EXIT_MM 430    /* выход из зоны; фон в комнате начинается выше 440 мм */
 #define LEVELS       40
+#define FULL_TRAVEL_CM 15.0
+#define STEP_DEADBAND 2
 #define MUTE_HOLD_MS 700
-#define SETTLE_MS    50
-#define ZONE_MS      150
+#define SETTLE_MS    120
+#define ZONE_MS      250
+#define HAND_LOST_MS 1000
 #define CLEAR_MS     500
-#define VOL_MS       60
+#define VOL_MS       100
 #define I2C_BUS      0
 #define I2C_ADDR     0x3c
 
@@ -77,28 +81,51 @@ static int set_volume(int pct)
     return amixer_command("Master", value);
 }
 
-static int step_for_distance(int mm)
+static int read_volume(void)
 {
-    /* Эмпирические пары (мм показания -> %) для фактических расстояний
-       15/20/25/30 см. VL53L0 нелинеен в ближней зоне. */
-    static const int distance_mm[] = { 100, 145, 175, 320 };
-    static const int percent[] = { 0, 33, 66, 100 };
+    const char *query =
+        "LD_LIBRARY_PATH=/system/vendor/quasar/libs "
+        "/system/workdir/bin/amixer -c 0 sget Master 2>/dev/null";
+    FILE *fp = popen(query, "r");
+    if (!fp) return 0;
+    char line[256];
     int pct = 0;
-
-    if (mm <= distance_mm[0])
-        return 0;
-    if (mm >= distance_mm[3])
-        return LEVELS;
-
-    for (size_t i = 1; i < sizeof(distance_mm) / sizeof(distance_mm[0]); i++) {
-        if (mm <= distance_mm[i]) {
-            pct = percent[i - 1] +
-                  (mm - distance_mm[i - 1]) * (percent[i] - percent[i - 1]) /
-                  (distance_mm[i] - distance_mm[i - 1]);
-            return (pct * LEVELS + 50) / 100;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "Front Left:")) {
+            char *start = strchr(line, '[');
+            if (start) {
+                char *end = NULL;
+                long value = strtol(start + 1, &end, 10);
+                if (end != start + 1 && *end == '%') {
+                    if (value < 0) value = 0;
+                    if (value > 100) value = 100;
+                    pct = (int)value;
+                    break;
+                }
+            }
         }
     }
-    return LEVELS;
+    pclose(fp);
+    return pct;
+}
+
+static double distance_mm_to_cm(int mm)
+{
+    /* Получено при ручной калибровке 15, 20, 25, 30 и 40 см. */
+    static const int sensor_mm[] = { 93, 110, 145, 175, 320, 400 };
+    static const int physical_cm[] = { 10, 15, 20, 25, 30, 40 };
+    if (mm <= sensor_mm[0]) return physical_cm[0];
+    if (mm >= sensor_mm[5]) return physical_cm[5];
+
+    for (size_t i = 1; i < sizeof(sensor_mm) / sizeof(sensor_mm[0]); i++) {
+        if (mm <= sensor_mm[i]) {
+            double fraction = (double)(mm - sensor_mm[i - 1]) /
+                              (sensor_mm[i] - sensor_mm[i - 1]);
+            return physical_cm[i - 1] +
+                   fraction * (physical_cm[i] - physical_cm[i - 1]);
+        }
+    }
+    return physical_cm[5];
 }
 
 static void toggle_mute(void)
@@ -152,12 +179,16 @@ int main(int argc, char **argv)
     struct input_event ev;
     double ema = -1;
     int last_written = -1;
-    int cur_step = -1, cand_step = -1;
+    int current_pct = calibration_mode ? 0 : read_volume();
+    int cur_step = (current_pct * LEVELS + 50) / 100;
+    int cand_step = -1, anchor_step = cur_step, anchor_valid = 0;
+    double anchor_cm = 0;
     int in_zone = 0, red = 0, mute_latched = 0;
-    int pending_vol = -1, applied_vol = -1;
+    int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
     int bar_n = -1, shown = 0;
     long long cand_t = 0, near_since = 0, last_mute = 0, last_apply = 0;
-    long long zone_since = 0, last_near = 0, last_report = 0;
+    long long zone_since = 0, hand_lost_since = 0;
+    long long last_near = 0, last_report = 0;
 
     while (1) {
         ssize_t n = read(fd, &ev, sizeof(ev));
@@ -168,7 +199,8 @@ int main(int argc, char **argv)
         if (raw <= 0) continue;
         long long t = now_ms();
 
-        ema = (ema < 0) ? raw : (ema * 0.5 + raw * 0.5);
+        /* Stronger smoothing keeps sensor quantization from looking like motion. */
+        ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
         int d = (int)(ema + 0.5);
 
         if (last_written < 0 || abs(d - last_written) >= 2) {
@@ -197,8 +229,6 @@ int main(int argc, char **argv)
 
         if (red) {
             if (bar_n != 6 || !shown) { led_bar(6, 255, 0, 0); bar_n = 6; shown = 1; }
-            in_zone = 0;
-            zone_since = 0;
             last_near = t;
             if (!near_since) near_since = t;
             if (!mute_latched && t - near_since > MUTE_HOLD_MS && t - last_mute > 1500) {
@@ -209,34 +239,72 @@ int main(int argc, char **argv)
         } else {
             near_since = 0;
             mute_latched = 0;
+        }
 
-            if (!in_zone) {
-                if (d <= MAX_MM) {
-                    if (!zone_since) zone_since = t;
-                    if (t - zone_since >= ZONE_MS) in_zone = 1;
-                } else {
-                    zone_since = 0;
-                    cand_step = -1;
+        if (!in_zone) {
+            if (d <= MAX_MM) {
+                if (!zone_since) zone_since = t;
+                if (t - zone_since >= ZONE_MS) {
+                    in_zone = 1;
+                    anchor_valid = 1;
+                    hand_lost_since = 0;
+                    anchor_cm = distance_mm_to_cm(d);
+                    anchor_step = cur_step;
+                    cand_step = cur_step;
+                    cand_t = t;
                 }
-            } else if (d > ZONE_EXIT_MM) {
-                in_zone = 0;
+            } else {
                 zone_since = 0;
+                anchor_valid = 0;
                 cand_step = -1;
             }
-
-            if (in_zone) {
-                int step = step_for_distance(d);
-
-                if (step != cand_step) { cand_step = step; cand_t = t; }
-
-                if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
-                    cur_step = cand_step;
-                    pending_vol = cur_step * 100 / LEVELS;
-                    int leds = (cur_step * 6 + LEVELS / 2) / LEVELS;
-                    if (leds != bar_n || !shown) { led_bar(leds, 0, 160, 255); bar_n = leds; shown = 1; }
-                }
-                last_near = t;
+        } else if (d > ZONE_EXIT_MM) {
+            if (!hand_lost_since) {
+                hand_lost_since = t;
+                fprintf(stderr, "hand_lost: holding control for %d ms\n", HAND_LOST_MS);
+            } else if (t - hand_lost_since >= HAND_LOST_MS) {
+                in_zone = 0;
+                anchor_valid = 0;
+                zone_since = 0;
+                cand_step = -1;
+                hand_lost_since = 0;
+                fprintf(stderr, "hand_timeout: control ended\n");
             }
+        } else if (hand_lost_since) {
+            /* Resume without a jump: make the returning hand the new anchor. */
+            hand_lost_since = 0;
+            anchor_cm = distance_mm_to_cm(d);
+            anchor_step = cur_step;
+            cand_step = cur_step;
+            cand_t = t;
+            fprintf(stderr, "hand_returned: control resumed\n");
+        }
+
+        if (in_zone && anchor_valid && !hand_lost_since && d <= ZONE_EXIT_MM) {
+            double travel_cm = distance_mm_to_cm(d) - anchor_cm;
+            double target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
+            int step = target_step >= 0 ? (int)(target_step + 0.5) :
+                                          (int)(target_step - 0.5);
+            if (step < 0) step = 0;
+            if (step > LEVELS) step = LEVELS;
+
+            /* Ignore sub-centimeter sensor jitter around the current level. */
+            if (abs(step - cur_step) < STEP_DEADBAND)
+                step = cur_step;
+
+            if (step != cand_step) { cand_step = step; cand_t = t; }
+
+            if (cand_step != cur_step && t - cand_t >= SETTLE_MS) {
+                cur_step = cand_step;
+                pending_vol = (cur_step * 100 + LEVELS / 2) / LEVELS;
+                int leds = (cur_step * 6 + LEVELS / 2) / LEVELS;
+                if (!red && (leds != bar_n || !shown)) {
+                    led_bar(leds, 0, 160, 255);
+                    bar_n = leds;
+                    shown = 1;
+                }
+            }
+            last_near = t;
         }
 
         /* гасим с задержкой, чтобы не мигало */
