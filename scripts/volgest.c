@@ -27,6 +27,7 @@
 #define RED_EXIT_MM  105    /* гистерезис выхода */
 #define MAX_MM       420    /* уверенно обнаруживаемая ближняя зона */
 #define ZONE_EXIT_MM 430    /* ближняя зона с гистерезисом */
+#define MAX_HAND_CM  70.0   /* жёсткий предел захвата по калибровочной шкале */
 #define HAND_DELTA_MM 45    /* дальняя рука: отличие от адаптивного фона */
 #define HAND_RELEASE_DELTA_MM 30
 #define AMBIENT_ALPHA 0.01  /* адаптация фона только вне активного захвата */
@@ -311,12 +312,13 @@ int main(int argc, char **argv)
          * cutoff loses a hand before 50 cm; a fixed 50 cm cutoff confuses it
          * with the no-hand return. Track the latter only while unarmed. */
         if (ambient_mm < 0) ambient_mm = d;
+        int within_hand_limit = distance_mm_to_cm(d) <= MAX_HAND_CM;
         int far_hand_enter = d < ambient_mm - HAND_DELTA_MM;
         int far_hand_keep = d < ambient_mm - HAND_RELEASE_DELTA_MM;
         if (!in_zone && d > MAX_MM && !far_hand_enter)
             ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
-        int hand_enter = d <= MAX_MM || far_hand_enter;
-        int hand_keep = d <= ZONE_EXIT_MM || far_hand_keep;
+        int hand_enter = within_hand_limit && (d <= MAX_MM || far_hand_enter);
+        int hand_keep = within_hand_limit && (d <= ZONE_EXIT_MM || far_hand_keep);
 
         if (last_written < 0 || abs(d - last_written) >= 2) {
             FILE *fp = fopen("/tmp/volgest.dist", "w");
