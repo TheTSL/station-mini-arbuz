@@ -472,22 +472,28 @@ int main(int argc, char **argv)
                 int step;
 
                 if (min_latched) {
-                    /* Track further inward motion. Once the hand has deliberately
-                     * retreated by 3 cm, make that position a fresh 0% anchor. Do
-                     * not map the retreat itself to volume: only subsequent motion
-                     * outward raises the level. */
+                    /* Let the 0% endpoint follow the hand further inward. Keep
+                     * that deepest position as the reference for the return:
+                     * a fast move beyond the 3 cm guard must not discard its
+                     * remaining distance when the latch releases. */
                     if (hand_cm < anchor_cm) anchor_cm = hand_cm;
                     travel_cm = hand_cm - anchor_cm;
                     if (travel_cm < MIN_LIMIT_RELEASE_CM) {
                         step = 0;
                     } else {
                         min_latched = 0;
-                        anchor_cm = hand_cm;
+                        anchor_cm += MIN_LIMIT_RELEASE_CM;
                         anchor_step = 0;
-                        step = 0;
-                        cand_step = 0;
-                        cand_t = t;
-                        fprintf(stderr, "min_rearmed: new 0%% anchor; move outward to raise volume\n");
+                        target_step = (hand_cm - anchor_cm) * LEVELS / FULL_TRAVEL_CM;
+                        if (target_step >= LEVELS) {
+                            step = LEVELS;
+                            max_latched = 1;
+                            anchor_cm = hand_cm;
+                            anchor_step = LEVELS;
+                        } else {
+                            step = (int)(target_step + 0.5);
+                        }
+                        fprintf(stderr, "min_released: 0%% endpoint extended; step=%d\n", step);
                     }
                 } else if (max_latched) {
                     /* Symmetric hold at 100%; the hand must move inward
