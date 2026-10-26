@@ -497,8 +497,9 @@ int main(int argc, char **argv)
         }
 
         /* гасим с задержкой, чтобы не мигало */
-        if (hand_seen) last_near = t;
-        if (shown && !in_zone && !hand_seen && t - last_near > CLEAR_MS) {
+        int marker_active = hand_seen || in_zone;
+        if (marker_active) last_near = t;
+        if (shown && !marker_active && t - last_near > CLEAR_MS) {
             led_bar(0, 0, 0, 0, 0);
             shown = 0;
         }
@@ -527,10 +528,10 @@ int main(int argc, char **argv)
         }
 
         /* Reassert the display while the hand is captured so the ring stays lit. */
-        if (in_zone || hand_seen) {
+        if (marker_active) {
             int bucket = applied_vol / 10;
             if (t - last_led_refresh >= LED_REFRESH_MS || bucket != led_bucket) {
-                led_volume(applied_vol, hand_seen);
+                led_volume(applied_vol, marker_active);
                 led_bucket = bucket;
                 shown = 1;
                 last_led_refresh = t;
