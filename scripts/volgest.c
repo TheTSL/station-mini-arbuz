@@ -24,8 +24,8 @@
 
 #define MAX_MM       420    /* уверенно обнаруживаемая ближняя зона */
 #define MAX_HAND_CM  60.0   /* заявленная дальность ToF для жестов */
-#define FAR_HAND_ENTER_MM 50
-#define FAR_HAND_RELEASE_MM 30
+#define FAR_HAND_ENTER_MM 80
+#define FAR_HAND_RELEASE_MM 50
 #define AMBIENT_ALPHA 0.01
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
