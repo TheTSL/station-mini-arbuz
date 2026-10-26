@@ -26,6 +26,7 @@
 #define ZONE_EXIT_MM 430    /* ближняя зона с гистерезисом */
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
+#define LIMIT_RELEASE_CM 3.0
 #define STEP_DEADBAND 2
 #define HOVER_STABLE_MS 350
 #define HOVER_SPAN_MM 12
@@ -256,7 +257,7 @@ int main(int argc, char **argv)
     int cur_step = (current_pct * LEVELS + 50) / 100;
     int cand_step = -1, anchor_step = cur_step;
     double anchor_cm = 0;
-    int in_zone = 0, armed = 0;
+    int in_zone = 0, armed = 0, min_latched = 0, max_latched = 0;
     int pending_vol = -1, applied_vol = calibration_mode ? -1 : current_pct;
     int shown = 0, led_bucket = -1;
     long long cand_t = 0, last_apply = 0;
@@ -373,6 +374,8 @@ int main(int argc, char **argv)
                         armed = 1;
                         anchor_cm = distance_mm_to_cm(d);
                         anchor_step = cur_step;
+                        min_latched = cur_step == 0;
+                        max_latched = cur_step == LEVELS;
                         cand_step = cur_step;
                         cand_t = t;
                         set_hand_state(2);
@@ -380,25 +383,57 @@ int main(int argc, char **argv)
                     }
                 }
             } else {
-                double travel_cm = distance_mm_to_cm(d) - anchor_cm;
-                double target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
-                int step = target_step >= 0 ? (int)(target_step + 0.5) :
+                double hand_cm = distance_mm_to_cm(d);
+                double travel_cm = hand_cm - anchor_cm;
+                double target_step;
+                int step;
+
+                if (min_latched) {
+                    /* Track only further inward motion; ignore the near-field
+                     * jitter until the hand deliberately moves away by 3 cm. */
+                    if (hand_cm < anchor_cm) anchor_cm = hand_cm;
+                    travel_cm = hand_cm - anchor_cm;
+                    if (travel_cm < LIMIT_RELEASE_CM) {
+                        step = 0;
+                    } else {
+                        min_latched = 0;
+                        anchor_step = 0;
+                        target_step = travel_cm * LEVELS / FULL_TRAVEL_CM;
+                        step = (int)(target_step + 0.5);
+                    }
+                } else if (max_latched) {
+                    /* Symmetric hold at 100%; the hand must move inward
+                     * deliberately before the level starts falling. */
+                    if (hand_cm > anchor_cm) anchor_cm = hand_cm;
+                    travel_cm = hand_cm - anchor_cm;
+                    if (travel_cm > -LIMIT_RELEASE_CM) {
+                        step = LEVELS;
+                    } else {
+                        max_latched = 0;
+                        anchor_step = LEVELS;
+                        target_step = LEVELS + travel_cm * LEVELS / FULL_TRAVEL_CM;
+                        step = (int)(target_step + 0.5);
+                    }
+                } else {
+                    target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
+                    step = target_step >= 0 ? (int)(target_step + 0.5) :
                                               (int)(target_step - 0.5);
-                if (step >= LEVELS && target_step > LEVELS) {
-                    /* At full volume, keep following continued outward motion.
-                     * This moves the virtual upper limit with the user's hand. */
-                    step = LEVELS;
-                    anchor_cm = distance_mm_to_cm(d);
-                    anchor_step = LEVELS;
-                } else if (step <= 0 && target_step < 0) {
-                    /* At minimum volume, keep following continued inward motion. */
-                    step = 0;
-                    anchor_cm = distance_mm_to_cm(d);
-                    anchor_step = 0;
+                    if (target_step >= LEVELS) {
+                        step = LEVELS;
+                        max_latched = 1;
+                        anchor_cm = hand_cm;
+                        anchor_step = LEVELS;
+                    } else if (target_step <= 0) {
+                        step = 0;
+                        min_latched = 1;
+                        anchor_cm = hand_cm;
+                        anchor_step = 0;
+                    }
                 }
 
                 /* No volume changes until movement is clearly outside the hover band. */
-                if ((travel_cm < 0 ? -travel_cm : travel_cm) < MOVE_START_CM)
+                if (!min_latched && !max_latched &&
+                    (travel_cm < 0 ? -travel_cm : travel_cm) < MOVE_START_CM)
                     step = anchor_step;
                 if (abs(step - cur_step) < STEP_DEADBAND)
                     step = cur_step;
