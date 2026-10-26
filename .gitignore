@@ -5,6 +5,15 @@ certs/
 leaf.key
 chain.pem
 account_storage.dat
+token
+token.*
+.env
+.env.*
+!.env.example
+id_rsa
+id_ed25519
+authorized_keys
+known_hosts
 *.log
 logs/
 captures/
