@@ -29,17 +29,18 @@
 #define AMBIENT_ALPHA 0.01
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
-#define LIMIT_RELEASE_CM 3.0
+#define MIN_LIMIT_RELEASE_CM 3.0
+#define MAX_LIMIT_RELEASE_CM 1.5
 #define STEP_DEADBAND 2
-#define HOVER_STABLE_MS 350
+#define HOVER_STABLE_MS 250
 #define HOVER_SPAN_MM 12
 #define MOVE_START_CM 0.8
-#define SETTLE_MS    50
-#define ZONE_MS      250
+#define SETTLE_MS    25
+#define ZONE_MS      150
 #define HAND_LOST_MS 1000
 #define CLEAR_MS     500
-#define VOL_MS       60
-#define VOL_SLEW_PCT 5
+#define VOL_MS       40
+#define VOL_SLEW_PCT 8
 #define FEEDBACK_STEP_PCT 10
 #define FEEDBACK_COOLDOWN_MS 250
 #define LED_SEGMENTS 10
@@ -416,7 +417,7 @@ int main(int argc, char **argv)
                      * outward raises the level. */
                     if (hand_cm < anchor_cm) anchor_cm = hand_cm;
                     travel_cm = hand_cm - anchor_cm;
-                    if (travel_cm < LIMIT_RELEASE_CM) {
+                    if (travel_cm < MIN_LIMIT_RELEASE_CM) {
                         step = 0;
                     } else {
                         min_latched = 0;
@@ -432,7 +433,7 @@ int main(int argc, char **argv)
                      * deliberately before the level starts falling. */
                     if (hand_cm > anchor_cm) anchor_cm = hand_cm;
                     travel_cm = hand_cm - anchor_cm;
-                    if (travel_cm > -LIMIT_RELEASE_CM) {
+                    if (travel_cm > -MAX_LIMIT_RELEASE_CM) {
                         step = LEVELS;
                     } else {
                         max_latched = 0;
