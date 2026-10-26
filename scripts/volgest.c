@@ -25,8 +25,11 @@
 
 #define RED_MM       96     /* ближе — красный / начало mute */
 #define RED_EXIT_MM  105    /* гистерезис выхода */
-#define MAX_MM       420    /* вход в рабочую зону */
-#define ZONE_EXIT_MM 430    /* выход из зоны; фон в комнате начинается выше 440 мм */
+#define MAX_MM       420    /* уверенно обнаруживаемая ближняя зона */
+#define ZONE_EXIT_MM 430    /* ближняя зона с гистерезисом */
+#define HAND_DELTA_MM 45    /* дальняя рука: отличие от адаптивного фона */
+#define HAND_RELEASE_DELTA_MM 30
+#define AMBIENT_ALPHA 0.01  /* адаптация фона только вне активного захвата */
 #define LEVELS       40
 #define FULL_TRAVEL_CM 15.0
 #define STEP_DEADBAND 2
@@ -183,8 +186,18 @@ static double distance_mm_to_cm(int mm)
     /* Получено при ручной калибровке 15, 20, 25, 30 и 40 см. */
     static const int sensor_mm[] = { 93, 110, 145, 175, 320, 400 };
     static const int physical_cm[] = { 10, 15, 20, 25, 30, 40 };
-    if (mm <= sensor_mm[0]) return physical_cm[0];
-    if (mm >= sensor_mm[5]) return physical_cm[5];
+    if (mm < sensor_mm[0]) {
+        /* Экстраполяция сохраняет чувствительность у ближнего предела сенсора. */
+        return physical_cm[0] + (mm - sensor_mm[0]) *
+               (double)(physical_cm[1] - physical_cm[0]) /
+               (sensor_mm[1] - sensor_mm[0]);
+    }
+    if (mm > sensor_mm[5]) {
+        /* Продлеваем масштаб за последнюю калибровочную точку (40 см). */
+        return physical_cm[5] + (mm - sensor_mm[5]) *
+               (double)(physical_cm[5] - physical_cm[4]) /
+               (sensor_mm[5] - sensor_mm[4]);
+    }
 
     for (size_t i = 1; i < sizeof(sensor_mm) / sizeof(sensor_mm[0]); i++) {
         if (mm <= sensor_mm[i]) {
@@ -261,6 +274,7 @@ int main(int argc, char **argv)
     long long zone_since = 0, hover_since = 0, hand_lost_since = 0;
     long long last_feedback = 0;
     int hover_min = 0, hover_max = 0;
+    double ambient_mm = -1;
     long long last_near = 0, last_report = 0;
 
     while (1) {
@@ -276,6 +290,17 @@ int main(int argc, char **argv)
         ema = (ema < 0) ? raw : (ema * 0.8 + raw * 0.2);
         int d = (int)(ema + 0.5);
 
+        /* The far end is identified relative to the room return. A fixed 42 cm
+         * cutoff loses a hand before 50 cm; a fixed 50 cm cutoff confuses it
+         * with the no-hand return. Track the latter only while unarmed. */
+        if (ambient_mm < 0) ambient_mm = d;
+        int far_hand_enter = d < ambient_mm - HAND_DELTA_MM;
+        int far_hand_keep = d < ambient_mm - HAND_RELEASE_DELTA_MM;
+        if (!in_zone && d > MAX_MM && !far_hand_enter)
+            ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
+        int hand_enter = d <= MAX_MM || far_hand_enter;
+        int hand_keep = d <= ZONE_EXIT_MM || far_hand_keep;
+
         if (last_written < 0 || abs(d - last_written) >= 2) {
             FILE *fp = fopen("/tmp/volgest.dist", "w");
             if (fp) {
@@ -286,7 +311,7 @@ int main(int argc, char **argv)
         }
 
         if (calibration_mode) {
-            set_hand_state(d <= MAX_MM ? 2 : 0);
+            set_hand_state(hand_enter ? 2 : 0);
             if (t - last_report >= 100) {
                 fprintf(stderr, "%lld raw=%d filtered=%d\n", t, raw, d);
                 last_report = t;
@@ -316,7 +341,7 @@ int main(int argc, char **argv)
         }
 
         if (!in_zone) {
-            if (d <= MAX_MM) {
+            if (hand_enter) {
                 set_hand_state(1);
                 if (!zone_since) zone_since = t;
                 if (t - zone_since >= ZONE_MS) {
@@ -335,7 +360,7 @@ int main(int argc, char **argv)
                 cand_step = -1;
                 set_hand_state(0);
             }
-        } else if (d > ZONE_EXIT_MM) {
+        } else if (!hand_keep) {
             if (!hand_lost_since) {
                 hand_lost_since = t;
                 set_hand_state(3);
@@ -370,7 +395,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "hand_returned: waiting for steady hover\n");
         }
 
-        if (in_zone && !hand_lost_since && d <= ZONE_EXIT_MM) {
+        if (in_zone && !hand_lost_since && hand_keep) {
             if (!armed) {
                 set_hand_state(1);
                 if (!hover_since) {
@@ -398,8 +423,18 @@ int main(int argc, char **argv)
                 double target_step = anchor_step + travel_cm * LEVELS / FULL_TRAVEL_CM;
                 int step = target_step >= 0 ? (int)(target_step + 0.5) :
                                               (int)(target_step - 0.5);
-                if (step < 0) step = 0;
-                if (step > LEVELS) step = LEVELS;
+                if (step >= LEVELS && target_step > LEVELS) {
+                    /* At full volume, keep following continued outward motion.
+                     * This moves the virtual upper limit with the user's hand. */
+                    step = LEVELS;
+                    anchor_cm = distance_mm_to_cm(d);
+                    anchor_step = LEVELS;
+                } else if (step <= 0 && target_step < 0) {
+                    /* Symmetric behavior at mute: allow continued inward motion. */
+                    step = 0;
+                    anchor_cm = distance_mm_to_cm(d);
+                    anchor_step = 0;
+                }
 
                 /* No volume changes until movement is clearly outside the hover band. */
                 if ((travel_cm < 0 ? -travel_cm : travel_cm) < MOVE_START_CM)
