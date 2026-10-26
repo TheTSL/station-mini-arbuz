@@ -210,7 +210,7 @@ static double distance_mm_to_cm(int mm)
     return physical_cm[5];
 }
 
-static void led_bar(int n, int r, int g, int b)
+static void led_bar(int n, int r, int g, int b, int hand_marker)
 {
     if (i2c_fd < 0) return;
     if (n < 0) n = 0;
@@ -220,16 +220,22 @@ static void led_bar(int n, int r, int g, int b)
     buf[0] = 0x01;
     for (int i = 0; i < LED_SEGMENTS; i++) {
         int on = (i < n);
-        buf[1 + i*3 + 0] = on ? (unsigned char)b : 0;
-        buf[1 + i*3 + 1] = on ? (unsigned char)g : 0;
-        buf[1 + i*3 + 2] = on ? (unsigned char)r : 0;
+        int pixel_r = r, pixel_g = g, pixel_b = b;
+        if (hand_marker && i == LED_SEGMENTS / 2) {
+            on = 1;
+            pixel_r = 153;
+            pixel_g = pixel_b = 0;
+        }
+        buf[1 + i*3 + 0] = on ? (unsigned char)pixel_b : 0;
+        buf[1 + i*3 + 1] = on ? (unsigned char)pixel_g : 0;
+        buf[1 + i*3 + 2] = on ? (unsigned char)pixel_r : 0;
     }
     if (write(i2c_fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) return;
     unsigned char commit[2] = { 0x25, 0xAA };
     if (write(i2c_fd, commit, 2) != 2) return;
 }
 
-static void led_volume(int pct)
+static void led_volume(int pct, int hand_marker)
 {
     static const int rainbow[11][3] = {
         {  90,   0, 153 }, /* violet */
@@ -249,7 +255,8 @@ static void led_volume(int pct)
     int decile = pct / 10;
     int n = (pct + 9) / 10;
     if (n < 1) n = 1;  /* keep a visible violet marker at 0% while a hand is present */
-    led_bar(n, rainbow[decile][0], rainbow[decile][1], rainbow[decile][2]);
+    led_bar(n, rainbow[decile][0], rainbow[decile][1], rainbow[decile][2],
+            hand_marker);
 }
 
 int main(int argc, char **argv)
@@ -311,6 +318,7 @@ int main(int argc, char **argv)
             ambient_mm += AMBIENT_ALPHA * (d - ambient_mm);
         int hand_enter = within_hand_limit && far_hand_enter;
         int hand_keep = within_hand_limit && far_hand_keep;
+        int hand_seen = hand_enter && hand_keep;
 
         if (last_written < 0 || abs(d - last_written) >= 2) {
             FILE *fp = fopen("/tmp/volgest.dist", "w");
@@ -489,8 +497,9 @@ int main(int argc, char **argv)
         }
 
         /* гасим с задержкой, чтобы не мигало */
-        if (shown && !in_zone && t - last_near > CLEAR_MS) {
-            led_bar(0, 0, 0, 0);
+        if (hand_seen) last_near = t;
+        if (shown && !in_zone && !hand_seen && t - last_near > CLEAR_MS) {
+            led_bar(0, 0, 0, 0, 0);
             shown = 0;
         }
 
@@ -518,10 +527,10 @@ int main(int argc, char **argv)
         }
 
         /* Reassert the display while the hand is captured so the ring stays lit. */
-        if (in_zone) {
+        if (in_zone || hand_seen) {
             int bucket = applied_vol / 10;
             if (t - last_led_refresh >= LED_REFRESH_MS || bucket != led_bucket) {
-                led_volume(applied_vol);
+                led_volume(applied_vol, hand_seen);
                 led_bucket = bucket;
                 shown = 1;
                 last_led_refresh = t;
